@@ -1,10 +1,29 @@
 import { CHARACTERS } from "./characters";
-import { BOSS_HP_SCALING_PER_CYCLE, BOSS_PHASE_INTERVAL, ENEMY_HP_SCALING_PER_PHASE, ENEMY_SPEED_SCALING_CAP, ENEMY_SPEED_SCALING_PER_PHASE, MIN_SPAWN_INTERVAL_MS, PHASE_ENEMY_CAPS, PHASE_MIXES, SPAWN_INTERVAL_REDUCTION_PER_PHASE_MS, WEAPON_DRAFT_PHASE_INTERVAL, BASE_SPAWN_INTERVAL_MS } from "./config/phases";
+import { BOSS_ORDER, BOSSES } from "./config/boss";
+import { PHASE_MIXES, BOSS_PHASE_INTERVAL, PHASE_DURATION_MS, WEAPON_DRAFT_PHASE_INTERVAL } from "./config/phases";
 import { BASE_PLAYER_STATS } from "./config/player";
+import {
+  BURST_WAVE_BASE_COUNT,
+  BURST_WAVE_COUNT_CAP,
+  BURST_WAVE_INTERVAL_MS,
+  BURST_WAVE_PER_FIVE_PHASES,
+  DENSITY_CAP_MILESTONES,
+  DENSITY_CAP_POST_20_PER_PHASE,
+  ELITE_CHANCE_CAP,
+  ELITE_CHANCE_PER_PHASE,
+  ELITE_CHANCE_POST_20_BONUS,
+  ENEMY_HP_SCALING_PER_PHASE,
+  ENEMY_SPEED_SCALING_PER_PHASE,
+  SPAWN_RATE_BASE_PER_SECOND,
+  SPAWN_RATE_DOUBLE_PHASE,
+  SPAWN_RATE_PER_PHASE
+} from "./config/spawnCurve";
 import { LEVEL_XP_BASE, LEVEL_XP_PER_LEVEL } from "./config/progression";
+import { SYNERGY_POOL } from "./config/synergies";
 import { UPGRADE_BY_ID } from "./config/upgrades";
 import { WEAPONS } from "./config/weapons";
 import type {
+  BossId,
   CharacterDef,
   CharacterId,
   EquippedWeapon,
@@ -12,6 +31,7 @@ import type {
   PendingSpawn,
   PlayerStats,
   QueuedReward,
+  SynergyId,
   TargetLike,
   UpgradeDef,
   UpgradeId,
@@ -23,12 +43,32 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
 }
 
+function interpolate(start: number, end: number, ratio: number): number {
+  return start + (end - start) * ratio;
+}
+
+function chooseFromPool<T>(pool: T[], roll = Math.random()): T {
+  const index = Math.min(pool.length - 1, Math.floor(clamp(roll, 0, 0.999999) * pool.length));
+  return pool[index];
+}
+
 export function getPhaseEnemyCap(phase: number): number {
-  if (phase <= PHASE_ENEMY_CAPS.length) {
-    return PHASE_ENEMY_CAPS[Math.max(0, phase - 1)];
+  if (phase <= DENSITY_CAP_MILESTONES[0].phase) {
+    return DENSITY_CAP_MILESTONES[0].cap;
   }
 
-  return PHASE_ENEMY_CAPS[PHASE_ENEMY_CAPS.length - 1] + (phase - PHASE_ENEMY_CAPS.length) * 5;
+  for (let index = 1; index < DENSITY_CAP_MILESTONES.length; index += 1) {
+    const previous = DENSITY_CAP_MILESTONES[index - 1];
+    const current = DENSITY_CAP_MILESTONES[index];
+
+    if (phase <= current.phase) {
+      const ratio = (phase - previous.phase) / (current.phase - previous.phase);
+      return Math.round(interpolate(previous.cap, current.cap, ratio));
+    }
+  }
+
+  const postTwenty = phase - DENSITY_CAP_MILESTONES[DENSITY_CAP_MILESTONES.length - 1].phase;
+  return DENSITY_CAP_MILESTONES[DENSITY_CAP_MILESTONES.length - 1].cap + postTwenty * DENSITY_CAP_POST_20_PER_PHASE;
 }
 
 export function getPhaseMix(phase: number): WeightedEnemyMix {
@@ -37,9 +77,20 @@ export function getPhaseMix(phase: number): WeightedEnemyMix {
   return entry ? entry.mix : PHASE_MIXES[PHASE_MIXES.length - 1].mix;
 }
 
+export function getEliteChance(phase: number): number {
+  return Math.min(ELITE_CHANCE_CAP, phase * ELITE_CHANCE_PER_PHASE + (phase > SPAWN_RATE_DOUBLE_PHASE ? ELITE_CHANCE_POST_20_BONUS : 0));
+}
+
 export function chooseEnemyType(phase: number, roll: number) {
+  const eliteChance = getEliteChance(phase);
+  const clampedRoll = clamp(roll, 0, 0.999999);
+
+  if (clampedRoll < eliteChance) {
+    return "elite" as const;
+  }
+
   const mix = getPhaseMix(phase);
-  const normalizedRoll = clamp(roll, 0, 0.999999) * 100;
+  const normalizedRoll = ((clampedRoll - eliteChance) / Math.max(0.0001, 1 - eliteChance)) * (mix.grunt + mix.runner + mix.tank + mix.shooter);
   const runnerThreshold = mix.grunt + mix.runner;
   const tankThreshold = runnerThreshold + mix.tank;
   const shooterThreshold = tankThreshold + mix.shooter;
@@ -49,7 +100,7 @@ export function chooseEnemyType(phase: number, roll: number) {
   if (normalizedRoll < tankThreshold) return "tank" as const;
   if (normalizedRoll < shooterThreshold) return "shooter" as const;
 
-  return "elite" as const;
+  return "grunt" as const;
 }
 
 export function isBossTriggerPhase(phase: number): boolean {
@@ -60,22 +111,39 @@ export function isWeaponDraftPhase(phase: number): boolean {
   return phase > 0 && phase % WEAPON_DRAFT_PHASE_INTERVAL === 0;
 }
 
-export function getPhaseSpawnInterval(phase: number): number {
-  return Math.max(MIN_SPAWN_INTERVAL_MS, BASE_SPAWN_INTERVAL_MS - (phase - 1) * SPAWN_INTERVAL_REDUCTION_PER_PHASE_MS);
+export function getSpawnRatePerSecond(phase: number): number {
+  const base = SPAWN_RATE_BASE_PER_SECOND + phase * SPAWN_RATE_PER_PHASE;
+  return phase > SPAWN_RATE_DOUBLE_PHASE ? base * 2 : base;
+}
+
+export function stepSpawnAccumulator(currentAccumulator: number, phase: number, deltaMs: number): { accumulator: number; spawnCount: number } {
+  const total = currentAccumulator + getSpawnRatePerSecond(phase) * (deltaMs / 1000);
+  const spawnCount = Math.floor(total);
+
+  return {
+    accumulator: total - spawnCount,
+    spawnCount
+  };
+}
+
+export function getBurstWaveInterval(): number {
+  return BURST_WAVE_INTERVAL_MS;
+}
+
+export function getBurstWaveCount(phase: number): number {
+  return Math.min(BURST_WAVE_COUNT_CAP, BURST_WAVE_BASE_COUNT + Math.floor(phase / 5) * BURST_WAVE_PER_FIVE_PHASES);
 }
 
 export function getEnemyHealthMultiplier(phase: number): number {
-  return 1 + Math.max(0, phase - 1) * ENEMY_HP_SCALING_PER_PHASE;
+  return 1 + phase * ENEMY_HP_SCALING_PER_PHASE;
 }
 
 export function getEnemySpeedMultiplier(phase: number): number {
-  return Math.min(ENEMY_SPEED_SCALING_CAP, 1 + Math.max(0, phase - 1) * ENEMY_SPEED_SCALING_PER_PHASE);
+  return 1 + phase * ENEMY_SPEED_SCALING_PER_PHASE;
 }
 
 export function getBossHealthMultiplier(phase: number): number {
-  const completedBossCycles = Math.max(0, Math.floor(phase / BOSS_PHASE_INTERVAL) - 1);
-
-  return 1 + completedBossCycles * BOSS_HP_SCALING_PER_CYCLE;
+  return 1 + phase * 0.2;
 }
 
 export function getXpToNextLevel(level: number): number {
@@ -125,8 +193,8 @@ export function getProjectileSpreadAngles(emittedCount: number, spreadCapDeg: nu
     return [0];
   }
 
-  const clampedSpreadMultiplier = Math.max(0.35, spreadMultiplier);
-  const rawFan = 4 + (emittedCount - 1) * (spreadCapDeg > 30 ? 4 : 2.5);
+  const clampedSpreadMultiplier = Math.max(0.3, spreadMultiplier);
+  const rawFan = 4 + (emittedCount - 1) * (spreadCapDeg > 30 ? 4 : 2.4);
   const spreadCap = spreadCapDeg * clampedSpreadMultiplier;
   const fan = Math.min(spreadCap, rawFan * clampedSpreadMultiplier);
   const step = fan / (emittedCount - 1);
@@ -186,9 +254,16 @@ function applyUpgradeEffects(stats: PlayerStats, upgradeId: UpgradeId, count: nu
   return nextStats;
 }
 
+export function getActiveSynergyIds(selected: Partial<Record<UpgradeId, number>>): SynergyId[] {
+  return SYNERGY_POOL.filter((synergy) =>
+    synergy.requires.every((requirementGroup) => requirementGroup.some((upgradeId) => (selected[upgradeId] ?? 0) > 0))
+  ).map((synergy) => synergy.id);
+}
+
 export function buildPlayerStats(
   selected: Partial<Record<UpgradeId, number>>,
-  character: CharacterId | CharacterDef
+  character: CharacterId | CharacterDef,
+  activeSynergyIds: SynergyId[] = getActiveSynergyIds(selected)
 ): PlayerStats {
   const characterDef = typeof character === "string" ? CHARACTERS[character] : character;
   let stats = applyCharacterToStats({ ...BASE_PLAYER_STATS }, characterDef);
@@ -201,6 +276,21 @@ export function buildPlayerStats(
     }
 
     stats = applyUpgradeEffects(stats, upgradeId, count);
+  }
+
+  if (activeSynergyIds.includes("critStorm")) {
+    stats.chainLightningChance += 0.12;
+    stats.chainLightningTargets += 1;
+  }
+
+  if (activeSynergyIds.includes("vampiricBarrage")) {
+    stats.lifeSteal += 0.02;
+    stats.attackSpeedMultiplier += 0.08;
+  }
+
+  if (activeSynergyIds.includes("toxicFirestorm")) {
+    stats.fireDps += 1;
+    stats.poisonDps += 1;
   }
 
   return stats;
@@ -232,15 +322,52 @@ export function drawUpgradeChoices(
   return choices;
 }
 
-export function drawWeaponChoices(pool: WeaponId[], count: number, rolls: number[] = []): WeaponId[] {
-  const remaining = [...pool];
+export function getUnlockedWeaponTier(phase: number): 1 | 2 | 3 | 4 {
+  if (phase >= 20) return 4;
+  if (phase >= 15) return 3;
+  if (phase >= 10) return 2;
+  return 1;
+}
+
+export function getUnlockedWeaponPool(phase: number): WeaponId[] {
+  const maxTier = getUnlockedWeaponTier(phase);
+  return Object.values(WEAPONS)
+    .filter((weapon) => weapon.tier <= maxTier)
+    .sort((a, b) => a.tier - b.tier || a.label.localeCompare(b.label))
+    .map((weapon) => weapon.id);
+}
+
+export function drawWeaponChoices(
+  phase: number,
+  ownedWeapons: WeaponId[],
+  count: number,
+  rolls: number[] = []
+): WeaponId[] {
+  const unlocked = getUnlockedWeaponPool(phase);
+  const remainingFresh = unlocked.filter((weaponId) => !ownedWeapons.includes(weaponId));
+  const freshPool = [...remainingFresh];
+  const fallbackPool = [...unlocked];
   const choices: WeaponId[] = [];
+  let rollIndex = 0;
 
-  for (let index = 0; index < count && remaining.length > 0; index += 1) {
-    const roll = rolls[index] ?? Math.random();
-    const choiceIndex = Math.min(remaining.length - 1, Math.floor(clamp(roll, 0, 0.999999) * remaining.length));
-    const [choice] = remaining.splice(choiceIndex, 1);
+  while (choices.length < count && freshPool.length > 0) {
+    const choice = chooseFromPool(freshPool, rolls[rollIndex] ?? Math.random());
+    rollIndex += 1;
+    choices.push(choice);
+    freshPool.splice(freshPool.indexOf(choice), 1);
+  }
 
+  const uniqueFallback = fallbackPool.filter((weaponId) => !choices.includes(weaponId));
+  while (choices.length < count && uniqueFallback.length > 0) {
+    const choice = chooseFromPool(uniqueFallback, rolls[rollIndex] ?? Math.random());
+    rollIndex += 1;
+    choices.push(choice);
+    uniqueFallback.splice(uniqueFallback.indexOf(choice), 1);
+  }
+
+  while (choices.length < count && fallbackPool.length > 0) {
+    const choice = chooseFromPool(fallbackPool, rolls[rollIndex] ?? Math.random());
+    rollIndex += 1;
     choices.push(choice);
   }
 
@@ -279,6 +406,25 @@ export function getReadyWeapons(
   return { fired, equippedWeapons: nextWeapons };
 }
 
+export function getBossIdForPhase(phase: number, lastBossId: BossId | null, roll = Math.random()): BossId | null {
+  if (!isBossTriggerPhase(phase)) {
+    return null;
+  }
+
+  const fixedBoss = BOSS_ORDER.find((bossId) => BOSSES[bossId].introductionPhase === phase);
+  if (fixedBoss) {
+    return fixedBoss;
+  }
+
+  const unlocked = BOSS_ORDER.filter((bossId) => BOSSES[bossId].introductionPhase <= phase);
+  if (unlocked.length === 0) {
+    return BOSS_ORDER[0];
+  }
+
+  const pool = lastBossId && unlocked.length > 1 ? unlocked.filter((bossId) => bossId !== lastBossId) : unlocked;
+  return chooseFromPool(pool, roll);
+}
+
 export function pickSpawnPoint(
   width: number,
   height: number,
@@ -289,7 +435,7 @@ export function pickSpawnPoint(
   occupied: Array<Pick<TargetLike, "x" | "y">>,
   rolls: number[] = []
 ): { x: number; y: number } | null {
-  const attempts = Math.max(6, Math.floor(rolls.length / 2));
+  const attempts = Math.max(8, Math.floor(rolls.length / 2) || 8);
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const xRoll = rolls[attempt * 2] ?? Math.random();
@@ -330,4 +476,8 @@ export function resolvePendingSpawns(
     ready,
     pending: remaining
   };
+}
+
+export function getPhaseTimerRemaining(time: number, phaseStartedAt: number): number {
+  return Math.max(0, PHASE_DURATION_MS - (time - phaseStartedAt));
 }

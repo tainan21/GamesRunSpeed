@@ -6,5 +6,7 @@ export * from "./player";
 export * from "./progression";
 export * from "./projectiles";
 export * from "./spawns";
+export * from "./spawnCurve";
+export * from "./synergies";
 export * from "./upgrades";
 export * from "./weapons";

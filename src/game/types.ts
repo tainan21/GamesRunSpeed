@@ -1,9 +1,79 @@
-export type WeaponId = "pistol" | "machineGun" | "shotgun" | "sniper" | "burstRifle";
+import { BOSS_IDS, WEAPON_IDS } from "./catalog";
+
+export type WeaponId = (typeof WEAPON_IDS)[number];
+export type BossId = (typeof BOSS_IDS)[number];
 
 export type NormalEnemyId = "grunt" | "runner" | "tank" | "shooter" | "elite";
 export type EnemyId = NormalEnemyId | "boss";
 export type EnemyProjectileType = "slow" | "fast";
-export type WeaponPreviewPattern = "single" | "stream" | "fan" | "pierce" | "burst";
+export type WeaponPreviewPattern =
+  | "single"
+  | "stream"
+  | "fan"
+  | "pierce"
+  | "burst"
+  | "beam"
+  | "explosive"
+  | "orbit"
+  | "chain"
+  | "nova";
+export type WeaponFamily =
+  | "basic"
+  | "spread"
+  | "elemental"
+  | "precision"
+  | "explosive"
+  | "orbital"
+  | "exotic"
+  | "experimental";
+export type WeaponTier = 1 | 2 | 3 | 4;
+export type WeaponBehaviorKind =
+  | "ballisticSingle"
+  | "ballisticBurst"
+  | "fanSpread"
+  | "streamDot"
+  | "beam"
+  | "pierceShot"
+  | "rocketOrGrenade"
+  | "mineDeploy"
+  | "orbitalHelper"
+  | "boomerangReturn"
+  | "chainCaster"
+  | "novaBurst";
+export type WeaponTag =
+  | "fire"
+  | "poison"
+  | "lightning"
+  | "ice"
+  | "acid"
+  | "explosive"
+  | "orbital"
+  | "precision"
+  | "beam"
+  | "bounce";
+export type WeaponVisualKind =
+  | "bullet"
+  | "pellet"
+  | "flame"
+  | "beam"
+  | "rocket"
+  | "grenade"
+  | "mine"
+  | "orbital"
+  | "boomerang"
+  | "lightning"
+  | "nova";
+export type WeaponImpactKind = "hit" | "elemental" | "explosive" | "chain" | "beam" | "orbital";
+export type BossAttackPatternKind =
+  | "aimedVolley"
+  | "radialBurst"
+  | "charge"
+  | "teleportBurst"
+  | "beamLane"
+  | "poisonPool"
+  | "lightningArc"
+  | "orbitingSatellite"
+  | "slowFieldPulse";
 
 export type FlowMode = "characterSelect" | "live" | "levelUp" | "weaponDraft" | "phaseTransition" | "gameOver";
 
@@ -53,10 +123,49 @@ export type UpgradeId =
   | "arcNetwork"
   | "guardianDrone";
 
+export type SynergyId =
+  | "fireExplosion"
+  | "toxicRicochet"
+  | "critStorm"
+  | "droneOverclock"
+  | "piercingRicochet"
+  | "vampiricBarrage"
+  | "blastFragmentation"
+  | "toxicFirestorm";
+
+export interface WeaponBehaviorConfig {
+  burstCount?: number;
+  burstIntervalMs?: number;
+  helperCap?: number;
+  helperFireRateMs?: number;
+  helperRadius?: number;
+  helperCount?: number;
+  returnDelayMs?: number;
+  explosionRadius?: number;
+  explosionDamage?: number;
+  shortLifetimeMs?: number;
+  beamWidth?: number;
+  beamLength?: number;
+  beamDurationMs?: number;
+  chainTargets?: number;
+  chainDamageMultiplier?: number;
+  chainRange?: number;
+  novaCount?: number;
+  mineArmMs?: number;
+  mineLifetimeMs?: number;
+}
+
 export interface WeaponDef {
   id: WeaponId;
   label: string;
   description: string;
+  family: WeaponFamily;
+  tier: WeaponTier;
+  behaviorKind: WeaponBehaviorKind;
+  tags: WeaponTag[];
+  visualKind: WeaponVisualKind;
+  impactKind: WeaponImpactKind;
+  behaviorConfig: WeaponBehaviorConfig;
   fireRateMs: number;
   damage: number;
   baseProjectiles: number;
@@ -66,6 +175,8 @@ export interface WeaponDef {
   iconKey: string;
   previewPattern: WeaponPreviewPattern;
   muzzleFlashTint: number;
+  trailTint?: number;
+  impactTint?: number;
   basePierce?: number;
   burstCount?: number;
   burstIntervalMs?: number;
@@ -88,6 +199,40 @@ export interface EnemyDef {
   projectileSpeed?: number;
   projectileDamage?: number;
   projectileBurstCount?: number;
+}
+
+export interface BossAttackPatternDef {
+  kind: BossAttackPatternKind;
+  cooldownMs: number;
+  projectileType?: EnemyProjectileType;
+  projectileSpeed?: number;
+  projectileDamage?: number;
+  volleyCount?: number;
+  fanSpreadDeg?: number;
+  chargeDurationMs?: number;
+  chargeSpeedMultiplier?: number;
+  beamDurationMs?: number;
+  beamWidth?: number;
+  areaRadius?: number;
+  slowMultiplier?: number;
+  orbitCount?: number;
+}
+
+export interface BossDef {
+  id: BossId;
+  label: string;
+  summary: string;
+  introductionPhase: number;
+  baseHp: number;
+  speed: number;
+  contactDamage: number;
+  radius: number;
+  tint: number;
+  deathTint: number;
+  knockbackResistance: number;
+  xpOrbCount: number;
+  xpOrbValue: number;
+  attackPatterns: BossAttackPatternDef[];
 }
 
 export interface WeightedEnemyMix {
@@ -169,6 +314,14 @@ export interface UpgradeDef {
   maxStacks?: number;
 }
 
+export interface SynergyDef {
+  id: SynergyId;
+  label: string;
+  description: string;
+  requires: UpgradeId[][];
+  accent: number;
+}
+
 export interface PersistentProfile {
   lastCharacterId: CharacterId;
 }
@@ -182,6 +335,7 @@ export interface EquippedWeapon {
 export interface PendingSpawn {
   id: number;
   enemyType: EnemyId;
+  bossId?: BossId;
   x: number;
   y: number;
   createdAt: number;
@@ -244,8 +398,13 @@ export interface RunState {
   queuedRewards: QueuedReward[];
   notifications: Notification[];
   xpOrbs: XpOrbState[];
+  activeSynergyIds: SynergyId[];
   shieldCharges: number;
   nextWeaponSlotId: number;
+  spawnAccumulator: number;
+  nextBurstAt: number;
+  bossUnlockIndex: number;
+  lastBossId: BossId | null;
   phaseTransitionEndsAt: number;
   weaponDraftOffer: WeaponDraftOffer | null;
 }

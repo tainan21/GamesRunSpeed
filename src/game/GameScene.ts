@@ -2,26 +2,9 @@ import Phaser from "phaser";
 import { SynthAudio } from "./audio";
 import { CHARACTERS, CHARACTER_ORDER } from "./characters";
 import {
-  BOSS,
-  BOSS_CHASE_DURATION_MS,
-  BOSS_FAST_ATTACK_COOLDOWN_MS,
-  BOSS_FAST_BURST_OFFSETS_DEG,
-  BOSS_FAST_PROJECTILE_DAMAGE,
-  BOSS_FAST_PROJECTILE_SPEED,
-  BOSS_HP_SCALING_PER_CYCLE,
-  BOSS_INITIAL_FAST_SHOT_DELAY_MS,
-  BOSS_INITIAL_MOVE_SWITCH_DELAY_MS,
-  BOSS_INITIAL_SLOW_SHOT_DELAY_MS,
+  BOSS_ORDER,
+  BOSSES,
   BOSS_PHASE_INTERVAL,
-  BOSS_SLOW_ATTACK_COOLDOWN_MS,
-  BOSS_SLOW_PROJECTILE_DAMAGE,
-  BOSS_SLOW_PROJECTILE_SPEED,
-  BOSS_SLOW_VOLLEY_OFFSETS_DEG,
-  BOSS_STRAFE_CHASE_BLEND,
-  BOSS_STRAFE_DURATION_MS,
-  BOSS_STRAFE_SPEED_MULTIPLIER,
-  BOSS_XP_ORB_COUNT,
-  BOSS_XP_ORB_VALUE,
   CARD_APPEAR_STAGGER_MS,
   CHAIN_LIGHTNING_RANGE,
   DRONE_FIRE_RATE_MS,
@@ -30,6 +13,7 @@ import {
   ENEMY_BULLET_LIFETIME_MS,
   FIRE_TICK_MS,
   LEVEL_UP_CARD_COUNT,
+  MAX_PENDING_SPAWNS,
   NOTIFICATION_DURATION_MS,
   PHASE_COMPLETE_DURATION_MS,
   PHASE_DURATION_MS,
@@ -53,6 +37,7 @@ import {
   WEAPON_ORDER,
   XP_TOUCH_RADIUS
 } from "./config";
+import { SYNERGY_BY_ID } from "./config/synergies";
 import { UPGRADE_POOL } from "./config/upgrades";
 import {
   appendEquippedWeapon,
@@ -61,29 +46,36 @@ import {
   buildPlayerStats,
   chooseEnemyType,
   createEquippedWeapon,
-  drawUpgradeChoices,
   drawWeaponChoices,
   findNearestTarget,
+  getActiveSynergyIds,
   getBossHealthMultiplier,
+  getBossIdForPhase,
+  getBurstWaveCount,
+  getBurstWaveInterval,
   getEnemyHealthMultiplier,
   getEnemySpeedMultiplier,
   getPhaseEnemyCap,
-  getPhaseSpawnInterval,
+  drawUpgradeChoices,
   getProjectileSpreadAngles,
   getReadyWeapons,
   getXpToNextLevel,
   isBossTriggerPhase,
   pickSpawnPoint,
-  resolvePendingSpawns
+  resolvePendingSpawns,
+  stepSpawnAccumulator
 } from "./logic";
 import { loadProfile, saveProfile } from "./profile";
 import type {
+  BossDef,
+  BossId,
   CharacterId,
   EnemyId,
   Notification,
   PendingSpawn,
   PersistentProfile,
   RunState,
+  SynergyId,
   TargetLike,
   UpgradeCategory,
   UpgradeDef,
@@ -100,6 +92,7 @@ type Keys = Record<"w" | "a" | "s" | "d" | "space" | "enter" | "one" | "two" | "
 interface EnemySprite extends Phaser.Physics.Arcade.Image, TargetLike {
   uid: number;
   enemyType: EnemyId;
+  bossId?: BossId;
   hp: number;
   maxHp: number;
   contactDamage: number;
@@ -113,6 +106,7 @@ interface EnemySprite extends Phaser.Physics.Arcade.Image, TargetLike {
   nextSlowShotAt: number;
   nextFastShotAt: number;
   nextMoveSwitchAt: number;
+  chargeUntil: number;
   bossStrafing: boolean;
   strafeDirection: number;
   burnUntil: number;
@@ -123,12 +117,22 @@ interface EnemySprite extends Phaser.Physics.Arcade.Image, TargetLike {
 
 interface BulletSprite extends Phaser.Physics.Arcade.Image {
   owner: "player" | "enemy";
+  weaponId?: WeaponId;
   damage: number;
   expiresAt: number;
   knockback: number;
   remainingPierce: number;
   remainingBounce: number;
   crit: boolean;
+  explosiveRadius: number;
+  explosiveDamage: number;
+  appliesFire: boolean;
+  appliesPoison: boolean;
+  returnsAt: number;
+  boomerangOwnerX: number;
+  boomerangOwnerY: number;
+  mineArmedAt: number;
+  fragmentCount: number;
   lastHitEnemyUid: number;
   lastHitTime: number;
   trailTint: number;
@@ -156,6 +160,8 @@ interface QueuedBurst {
   remainingShots: number;
   nextShotAt: number;
   intervalMs: number;
+  originX?: number;
+  originY?: number;
 }
 
 interface NotificationSlot {
@@ -169,6 +175,24 @@ interface DamageEnemyOptions {
   allowLifeSteal?: boolean;
   allowChain?: boolean;
   allowExplosion?: boolean;
+  forceFire?: boolean;
+  forcePoison?: boolean;
+}
+
+interface ActiveHazard {
+  id: number;
+  kind: "pool" | "slowField" | "beam";
+  x: number;
+  y: number;
+  radius: number;
+  angle?: number;
+  width?: number;
+  length?: number;
+  damagePerTick: number;
+  slowMultiplier?: number;
+  nextTickAt: number;
+  expiresAt: number;
+  gfx: Phaser.GameObjects.Graphics;
 }
 
 export class GameScene extends Phaser.Scene {
@@ -199,14 +223,18 @@ export class GameScene extends Phaser.Scene {
   private nextSpawnAttemptAt = 0;
   private playerInvulnerableUntil = 0;
   private playerFlashUntil = 0;
+  private playerSlowUntil = 0;
+  private playerSlowMultiplier = 1;
   private enemyUidCounter = 0;
   private pendingSpawnIdCounter = 0;
   private orbIdCounter = 0;
   private notificationIdCounter = 0;
+  private hazardIdCounter = 0;
   private burstQueue: QueuedBurst[] = [];
   private spawnMarkers = new Map<number, Phaser.GameObjects.Image>();
   private selectedCharacterId: CharacterId = "soldier";
   private drones: DroneSprite[] = [];
+  private hazards: ActiveHazard[] = [];
   private livePauseStartedAt: number | null = null;
   private phaseStartPending = false;
   private lastWeaponStripSignature = "";
@@ -271,12 +299,13 @@ export class GameScene extends Phaser.Scene {
     this.updatePlayerFlash(time);
     this.updateXpOrbs(time, delta);
     this.updatePendingSpawns(time);
-    this.tryScheduleNormalSpawn(time);
+    this.tryScheduleNormalSpawn(time, delta);
     this.updateEnemies(time);
     this.tryFireWeapons(time);
     this.processBurstQueue(time);
     this.updateDrones(time);
     this.updateProjectiles(time);
+    this.updateHazards(time);
     this.updatePhaseState(time);
     this.updateHud(time);
   }
@@ -296,16 +325,15 @@ export class GameScene extends Phaser.Scene {
     this.generateEnemyTexture("tank", 56, 0xf5e0ba, 0x443726);
     this.generateEnemyTexture("shooter", 48, 0xffd1b7, 0x563224);
     this.generateEnemyTexture("elite", 58, 0xff8ab0, 0x521f33);
-    this.generateBossTexture();
+    Object.values(BOSSES).forEach((boss, index) => this.generateBossTexture(`enemy-boss-${boss.id}`, boss.tint, boss.deathTint, index));
     this.generateSpawnMarkerTexture();
     this.generateXpOrbTexture();
     this.generateMuzzleFlashTexture();
     this.generateDroneTexture();
-    this.generateWeaponIconTexture("weapon-icon-pistol", 0xf0d6a2, "single");
-    this.generateWeaponIconTexture("weapon-icon-machineGun", 0xeeb976, "stream");
-    this.generateWeaponIconTexture("weapon-icon-shotgun", 0xe6a886, "fan");
-    this.generateWeaponIconTexture("weapon-icon-sniper", 0xaedff5, "pierce");
-    this.generateWeaponIconTexture("weapon-icon-burstRifle", 0xbadf86, "burst");
+    WEAPON_ORDER.forEach((weaponId) => {
+      const weapon = WEAPONS[weaponId];
+      this.generateWeaponIconTexture(weapon.iconKey, weapon.tint, weapon.previewPattern);
+    });
     this.generateUpgradeCategoryTexture("offense", 0xf2c071);
     this.generateUpgradeCategoryTexture("utility", 0x88d6c9);
     this.generateUpgradeCategoryTexture("projectile", 0x88b5ff);
@@ -368,16 +396,17 @@ export class GameScene extends Phaser.Scene {
     g.destroy();
   }
 
-  private generateBossTexture(): void {
+  private generateBossTexture(key: string, fill: number, accent: number, index: number): void {
     const g = this.make.graphics({ x: 0, y: 0 });
-    g.lineStyle(5, 0x2d1314, 1);
-    g.fillStyle(0xe39a9a, 1);
+    const stroke = Phaser.Display.Color.IntegerToColor(accent).darken(55).color;
+    g.lineStyle(5, stroke, 1);
+    g.fillStyle(fill, 1);
     g.fillCircle(44, 44, 34);
     g.strokeCircle(44, 44, 34);
-    g.fillStyle(0x2d1314, 1);
+    g.fillStyle(stroke, 1);
     g.fillCircle(31, 39, 5);
     g.fillCircle(56, 39, 5);
-    g.lineStyle(4, 0x2d1314, 1);
+    g.lineStyle(4, stroke, 1);
     g.beginPath();
     g.moveTo(22, 22);
     g.lineTo(30, 6);
@@ -385,8 +414,23 @@ export class GameScene extends Phaser.Scene {
     g.moveTo(66, 22);
     g.lineTo(58, 6);
     g.lineTo(50, 22);
+    if (index % 2 === 0) {
+      g.moveTo(44, 18);
+      g.lineTo(44, 4);
+    } else {
+      g.moveTo(40, 16);
+      g.lineTo(34, 4);
+      g.moveTo(48, 16);
+      g.lineTo(54, 4);
+    }
+    if (index >= 5) {
+      g.moveTo(16, 44);
+      g.lineTo(8, 34);
+      g.moveTo(72, 44);
+      g.lineTo(80, 34);
+    }
     g.strokePath();
-    g.generateTexture("enemy-boss", 88, 88);
+    g.generateTexture(key, 88, 88);
     g.destroy();
   }
 
@@ -463,6 +507,24 @@ export class GameScene extends Phaser.Scene {
       g.fillRect(23, 16, 7, 2);
       g.fillRect(23, 20, 7, 2);
       g.fillRect(29, 18, 4, 2);
+    } else if (pattern === "beam") {
+      g.fillRect(22, 17, 11, 4);
+      g.fillRect(30, 14, 4, 10);
+    } else if (pattern === "explosive") {
+      g.fillCircle(27, 18, 5);
+      g.lineBetween(27, 10, 27, 6);
+    } else if (pattern === "orbit") {
+      g.strokeCircle(27, 18, 6);
+      g.fillCircle(33, 18, 2);
+    } else if (pattern === "chain") {
+      g.lineStyle(2, tint, 1);
+      g.lineBetween(22, 18, 27, 12);
+      g.lineBetween(27, 12, 32, 18);
+      g.lineBetween(32, 18, 27, 24);
+    } else if (pattern === "nova") {
+      g.fillCircle(27, 18, 4);
+      g.lineBetween(27, 8, 27, 28);
+      g.lineBetween(17, 18, 37, 18);
     } else {
       g.fillRect(23, 18, 9, 2);
     }
@@ -527,8 +589,8 @@ export class GameScene extends Phaser.Scene {
 
   private createGroups(): void {
     this.enemies = this.physics.add.group({ runChildUpdate: false });
-    this.playerBullets = this.physics.add.group({ classType: Phaser.Physics.Arcade.Image, maxSize: 700, runChildUpdate: false });
-    this.enemyBullets = this.physics.add.group({ classType: Phaser.Physics.Arcade.Image, maxSize: 340, runChildUpdate: false });
+    this.playerBullets = this.physics.add.group({ classType: Phaser.Physics.Arcade.Image, maxSize: 1_500, runChildUpdate: false });
+    this.enemyBullets = this.physics.add.group({ classType: Phaser.Physics.Arcade.Image, maxSize: 520, runChildUpdate: false });
     this.xpOrbs = this.physics.add.group({ classType: Phaser.Physics.Arcade.Image, maxSize: 500, runChildUpdate: false });
   }
 
@@ -659,7 +721,8 @@ export class GameScene extends Phaser.Scene {
   }
 
   private createRunState(profile: PersistentProfile, characterId: CharacterId, time: number, flowMode: RunState["flowMode"]): RunState {
-    const stats = buildPlayerStats({}, characterId);
+    const activeSynergyIds: SynergyId[] = [];
+    const stats = buildPlayerStats({}, characterId, activeSynergyIds);
     return {
       flowMode,
       phase: 1,
@@ -684,8 +747,13 @@ export class GameScene extends Phaser.Scene {
       queuedRewards: [],
       notifications: [],
       xpOrbs: [],
+      activeSynergyIds,
       shieldCharges: stats.maxShieldCharges,
       nextWeaponSlotId: 1,
+      spawnAccumulator: 0,
+      nextBurstAt: time + getBurstWaveInterval(),
+      bossUnlockIndex: 0,
+      lastBossId: null,
       phaseTransitionEndsAt: 0,
       weaponDraftOffer: null
     };
@@ -707,6 +775,8 @@ export class GameScene extends Phaser.Scene {
     this.nextSpawnAttemptAt = this.time.now + 350;
     this.playerInvulnerableUntil = 0;
     this.playerFlashUntil = 0;
+    this.playerSlowUntil = 0;
+    this.playerSlowMultiplier = 1;
     this.livePauseStartedAt = null;
     this.phaseStartPending = false;
     this.pushNotification(`${CHARACTERS[characterId].label} ready`, CHARACTERS[characterId].accent, this.time.now);
@@ -726,7 +796,10 @@ export class GameScene extends Phaser.Scene {
     this.run.pendingSpawns = [];
     this.run.notifications = [];
     this.run.xpOrbs = [];
+    this.run.spawnAccumulator = 0;
+    this.run.nextBurstAt = this.time.now + getBurstWaveInterval();
     this.destroyDrones();
+    this.clearHazards();
     this.player.setVelocity(0, 0);
     this.lastWeaponStripSignature = "";
   }
@@ -797,9 +870,10 @@ export class GameScene extends Phaser.Scene {
     const moveX = (this.cursors.left.isDown || this.keys.a.isDown ? -1 : 0) + (this.cursors.right.isDown || this.keys.d.isDown ? 1 : 0);
     const moveY = (this.cursors.up.isDown || this.keys.w.isDown ? -1 : 0) + (this.cursors.down.isDown || this.keys.s.isDown ? 1 : 0);
     const direction = new Phaser.Math.Vector2(moveX, moveY);
+    const speedMultiplier = this.time.now < this.playerSlowUntil ? this.playerSlowMultiplier : 1;
 
     if (direction.lengthSq() > 0) {
-      direction.normalize().scale(this.run.stats.moveSpeed);
+      direction.normalize().scale(this.run.stats.moveSpeed * speedMultiplier);
       this.player.setVelocity(direction.x, direction.y);
       return;
     }
@@ -885,22 +959,49 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
-  private tryScheduleNormalSpawn(time: number): void {
-    if (time < this.nextSpawnAttemptAt) {
-      return;
+  private tryScheduleNormalSpawn(time: number, delta: number): void {
+    const pendingNormals = this.run.pendingSpawns.filter((spawn) => spawn.enemyType !== "boss").length;
+    const activeNormals = this.getActiveNormalEnemyCount();
+    const cap = getPhaseEnemyCap(this.run.phase);
+    const stepped = stepSpawnAccumulator(this.run.spawnAccumulator, this.run.phase, delta);
+    this.run.spawnAccumulator = stepped.accumulator;
+
+    let spawnBudget = Math.min(
+      stepped.spawnCount,
+      Math.max(0, cap - activeNormals - pendingNormals),
+      Math.max(0, MAX_PENDING_SPAWNS - this.run.pendingSpawns.length)
+    );
+
+    while (spawnBudget > 0) {
+      const point = this.getSafeSpawnPoint();
+      if (!point) {
+        break;
+      }
+
+      this.schedulePendingSpawn(chooseEnemyType(this.run.phase, Phaser.Math.FloatBetween(0, 1)), point.x, point.y, time);
+      spawnBudget -= 1;
     }
 
-    const activeNormals = this.getActiveNormalEnemyCount();
-    const pendingNormals = this.run.pendingSpawns.filter((spawn) => spawn.enemyType !== "boss").length;
+    if (time >= this.run.nextBurstAt) {
+      this.run.nextBurstAt += getBurstWaveInterval();
+      this.pushNotification("Burst wave", 0xffb28e, time);
+      this.showBanner("BURST WAVE", 900, time);
+      let burstBudget = Math.min(
+        getBurstWaveCount(this.run.phase),
+        Math.max(0, cap - this.getActiveNormalEnemyCount() - this.run.pendingSpawns.filter((spawn) => spawn.enemyType !== "boss").length),
+        Math.max(0, MAX_PENDING_SPAWNS - this.run.pendingSpawns.length)
+      );
 
-    if (activeNormals + pendingNormals < getPhaseEnemyCap(this.run.phase)) {
-      const point = this.getSafeSpawnPoint();
-      if (point) {
+      while (burstBudget > 0) {
+        const point = this.getSafeSpawnPoint();
+        if (!point) {
+          break;
+        }
+
         this.schedulePendingSpawn(chooseEnemyType(this.run.phase, Phaser.Math.FloatBetween(0, 1)), point.x, point.y, time);
+        burstBudget -= 1;
       }
     }
-
-    this.nextSpawnAttemptAt = time + getPhaseSpawnInterval(this.run.phase);
   }
 
   private getSafeSpawnPoint(): { x: number; y: number } | null {
@@ -934,18 +1035,29 @@ export class GameScene extends Phaser.Scene {
 
   private scheduleBossSpawn(time: number): void {
     const point = this.getSafeSpawnPoint() ?? this.getFallbackSpawnPoint();
-    this.schedulePendingSpawn("boss", point.x, point.y, time);
-    this.pushNotification("Boss incoming", 0xe58b8b, time);
+    const bossId = getBossIdForPhase(this.run.phase, this.run.lastBossId);
+    if (!bossId) {
+      return;
+    }
+
+    const boss = BOSSES[bossId];
+    this.run.lastBossId = bossId;
+    this.run.bossUnlockIndex = Math.max(
+      this.run.bossUnlockIndex,
+      BOSS_ORDER.findIndex((id) => id === bossId) + 1
+    );
+    this.schedulePendingSpawn("boss", point.x, point.y, time, bossId);
+    this.pushNotification(`Boss incoming: ${boss.label}`, boss.tint, time);
     this.showBanner("BOSS INCOMING", 1_100, time);
     this.audioController.boss();
   }
 
-  private schedulePendingSpawn(enemyType: EnemyId, x: number, y: number, time: number): void {
+  private schedulePendingSpawn(enemyType: EnemyId, x: number, y: number, time: number, bossId?: BossId): void {
     const id = this.pendingSpawnIdCounter++;
     const marker = this.add.image(x, y, "spawn-marker").setDepth(8);
     const scale = enemyType === "boss" ? 1.4 : enemyType === "elite" ? 1.15 : 1;
     marker.setScale(scale);
-    marker.setTint(enemyType === "boss" ? 0xffbf8a : enemyType === "elite" ? 0xff90b2 : 0xca3038);
+    marker.setTint(enemyType === "boss" ? BOSSES[bossId ?? "titan"].tint : enemyType === "elite" ? 0xff90b2 : 0xca3038);
     this.spawnMarkers.set(id, marker);
     this.tweens.add({
       targets: marker,
@@ -955,7 +1067,7 @@ export class GameScene extends Phaser.Scene {
       repeat: -1,
       duration: 280
     });
-    this.run.pendingSpawns.push({ id, enemyType, x, y, createdAt: time, spawnAt: time + SPAWN_TELEGRAPH_MS });
+    this.run.pendingSpawns.push({ id, enemyType, bossId, x, y, createdAt: time, spawnAt: time + SPAWN_TELEGRAPH_MS });
   }
 
   private updatePendingSpawns(time: number): void {
@@ -972,20 +1084,25 @@ export class GameScene extends Phaser.Scene {
     for (const spawn of resolved.ready) {
       this.spawnMarkers.get(spawn.id)?.destroy();
       this.spawnMarkers.delete(spawn.id);
-      this.spawnEnemy(spawn.enemyType, spawn.x, spawn.y, time);
+      this.spawnEnemy(spawn.enemyType, spawn.x, spawn.y, time, spawn.bossId);
     }
   }
 
-  private spawnEnemy(enemyType: EnemyId, x: number, y: number, time: number): void {
-    const baseDef = enemyType === "boss" ? BOSS : ENEMIES[enemyType];
+  private spawnEnemy(enemyType: EnemyId, x: number, y: number, time: number, bossId?: BossId): void {
+    const bossDef = enemyType === "boss" ? BOSSES[bossId ?? this.run.lastBossId ?? "titan"] : null;
+    const normalDef = enemyType === "boss" ? null : ENEMIES[enemyType as keyof typeof ENEMIES];
+    const baseDef = enemyType === "boss" && bossDef ? bossDef : normalDef!;
     const healthMultiplier = enemyType === "boss" ? getBossHealthMultiplier(this.run.phase) : getEnemyHealthMultiplier(this.run.phase);
-    const speedMultiplier = enemyType === "boss" ? getEnemySpeedMultiplier(this.run.phase) : getEnemySpeedMultiplier(this.run.phase);
-    const texture = enemyType === "boss" ? "enemy-boss" : `enemy-${enemyType}`;
+    const speedMultiplier = getEnemySpeedMultiplier(this.run.phase);
+    const texture = enemyType === "boss" && bossDef ? `enemy-boss-${bossDef.id}` : `enemy-${enemyType}`;
     const enemy = this.physics.add.image(x, y, texture) as EnemySprite;
-    const hp = Math.max(1, Math.round(baseDef.maxHp * healthMultiplier));
+    const baseHp = bossDef ? bossDef.baseHp : normalDef?.maxHp ?? 1;
+    const attackCooldownMs = normalDef?.attackCooldownMs ?? 0;
+    const hp = Math.max(1, Math.round(baseHp * healthMultiplier));
 
     enemy.uid = this.enemyUidCounter++;
     enemy.enemyType = enemyType;
+    enemy.bossId = bossDef?.id;
     enemy.hp = hp;
     enemy.maxHp = hp;
     enemy.contactDamage = baseDef.contactDamage;
@@ -995,10 +1112,11 @@ export class GameScene extends Phaser.Scene {
     enemy.deathTint = baseDef.deathTint;
     enemy.knockbackResistance = baseDef.knockbackResistance;
     enemy.flashUntil = 0;
-    enemy.nextAttackAt = time + (baseDef.attackCooldownMs ?? 0) + Phaser.Math.Between(40, 220);
-    enemy.nextSlowShotAt = time + BOSS_INITIAL_SLOW_SHOT_DELAY_MS;
-    enemy.nextFastShotAt = time + BOSS_INITIAL_FAST_SHOT_DELAY_MS;
-    enemy.nextMoveSwitchAt = time + BOSS_INITIAL_MOVE_SWITCH_DELAY_MS;
+    enemy.nextAttackAt = time + attackCooldownMs + Phaser.Math.Between(40, 220);
+    enemy.nextSlowShotAt = time + (bossDef?.attackPatterns[1]?.cooldownMs ?? 1_800);
+    enemy.nextFastShotAt = time + (bossDef?.attackPatterns[2]?.cooldownMs ?? 2_600);
+    enemy.nextMoveSwitchAt = time + 1_500;
+    enemy.chargeUntil = 0;
     enemy.bossStrafing = false;
     enemy.strafeDirection = Phaser.Math.RND.pick([-1, 1]);
     enemy.burnUntil = 0;
@@ -1017,7 +1135,7 @@ export class GameScene extends Phaser.Scene {
       duration: 170,
       ease: "Back.Out"
     });
-    this.spawnParticleBurst(x, y, enemyType === "boss" ? 10 : 5, enemyType === "boss" ? 0xffd9d9 : baseDef.deathTint);
+    this.spawnParticleBurst(x, y, enemyType === "boss" ? 10 : 5, enemyType === "boss" ? bossDef?.deathTint ?? 0xffd9d9 : baseDef.deathTint);
   }
 
   private updateEnemies(time: number): void {
@@ -1054,18 +1172,20 @@ export class GameScene extends Phaser.Scene {
   }
 
   private updateEnemyStatusEffects(enemy: EnemySprite, time: number): void {
-    if (enemy.burnUntil > time && this.run.stats.fireDps > 0 && time >= enemy.nextBurnTickAt) {
+    const fireDps = this.run.stats.fireDps > 0 ? this.run.stats.fireDps : 2;
+    if (enemy.burnUntil > time && time >= enemy.nextBurnTickAt) {
       enemy.nextBurnTickAt = time + FIRE_TICK_MS;
-      this.damageEnemy(enemy, this.run.stats.fireDps * (FIRE_TICK_MS / 1000), 0, 0, 0, {
+      this.damageEnemy(enemy, fireDps * (FIRE_TICK_MS / 1000), 0, 0, 0, {
         applyStatus: false,
         allowLifeSteal: false,
         allowChain: false
       });
     }
 
-    if (enemy.poisonUntil > time && this.run.stats.poisonDps > 0 && time >= enemy.nextPoisonTickAt) {
+    const poisonDps = this.run.stats.poisonDps > 0 ? this.run.stats.poisonDps : 1.5;
+    if (enemy.poisonUntil > time && time >= enemy.nextPoisonTickAt) {
       enemy.nextPoisonTickAt = time + POISON_TICK_MS;
-      this.damageEnemy(enemy, this.run.stats.poisonDps * (POISON_TICK_MS / 1000), 0, 0, 0, {
+      this.damageEnemy(enemy, poisonDps * (POISON_TICK_MS / 1000), 0, 0, 0, {
         applyStatus: false,
         allowLifeSteal: false,
         allowChain: false
@@ -1074,10 +1194,20 @@ export class GameScene extends Phaser.Scene {
   }
 
   private updateBossMovement(boss: EnemySprite, time: number): void {
+    const bossDef = boss.bossId ? BOSSES[boss.bossId] : BOSSES.titan;
+    if (time < boss.chargeUntil) {
+      const chargeVector = new Phaser.Math.Vector2(this.player.x - boss.x, this.player.y - boss.y);
+      if (chargeVector.lengthSq() > 0.001) {
+        chargeVector.normalize().scale(boss.moveSpeed * (bossDef.id === "ironColossus" ? 2.7 : 2.25));
+        this.getBody(boss).setVelocity(chargeVector.x, chargeVector.y);
+      }
+      return;
+    }
+
     if (time >= boss.nextMoveSwitchAt) {
       boss.bossStrafing = !boss.bossStrafing;
       boss.strafeDirection = Phaser.Math.RND.pick([-1, 1]);
-      boss.nextMoveSwitchAt = time + (boss.bossStrafing ? BOSS_STRAFE_DURATION_MS : BOSS_CHASE_DURATION_MS);
+      boss.nextMoveSwitchAt = time + (boss.bossStrafing ? 1_150 : 1_850);
     }
 
     const toPlayer = new Phaser.Math.Vector2(this.player.x - boss.x, this.player.y - boss.y);
@@ -1091,8 +1221,8 @@ export class GameScene extends Phaser.Scene {
       return;
     }
 
-    const strafe = toPlayer.clone().rotate((boss.strafeDirection * Math.PI) / 2).scale(boss.moveSpeed * BOSS_STRAFE_SPEED_MULTIPLIER);
-    const chase = toPlayer.clone().scale(boss.moveSpeed * BOSS_STRAFE_CHASE_BLEND);
+    const strafe = toPlayer.clone().rotate((boss.strafeDirection * Math.PI) / 2).scale(boss.moveSpeed * 0.82);
+    const chase = toPlayer.clone().scale(boss.moveSpeed * 0.28);
     this.getBody(boss).setVelocity(strafe.x + chase.x, strafe.y + chase.y);
   }
 
@@ -1126,35 +1256,24 @@ export class GameScene extends Phaser.Scene {
   }
 
   private updateBossAttacks(boss: EnemySprite, time: number): void {
-    if (time >= boss.nextSlowShotAt) {
-      const angle = Phaser.Math.Angle.Between(boss.x, boss.y, this.player.x, this.player.y);
-      for (const offset of BOSS_SLOW_VOLLEY_OFFSETS_DEG) {
-        this.spawnEnemyBullet(
-          boss.x,
-          boss.y,
-          angle + Phaser.Math.DegToRad(offset),
-          BOSS_SLOW_PROJECTILE_SPEED,
-          BOSS_SLOW_PROJECTILE_DAMAGE,
-          "slow"
-        );
-      }
-      boss.nextSlowShotAt = time + BOSS_SLOW_ATTACK_COOLDOWN_MS;
+    const bossDef = boss.bossId ? BOSSES[boss.bossId] : BOSSES.titan;
+    const chaosEnabled = this.run.phase >= 20;
+    const patterns = bossDef.attackPatterns;
+
+    if (patterns[0] && time >= boss.nextAttackAt) {
+      this.executeBossPattern(boss, patterns[0], time, chaosEnabled);
+      boss.nextAttackAt = time + patterns[0].cooldownMs * (chaosEnabled && patterns.length > 2 ? 0.92 : 1);
       this.audioController.boss();
     }
 
-    if (time >= boss.nextFastShotAt) {
-      const angle = Phaser.Math.Angle.Between(boss.x, boss.y, this.player.x, this.player.y);
-      for (const offset of BOSS_FAST_BURST_OFFSETS_DEG) {
-        this.spawnEnemyBullet(
-          boss.x,
-          boss.y,
-          angle + Phaser.Math.DegToRad(offset),
-          BOSS_FAST_PROJECTILE_SPEED,
-          BOSS_FAST_PROJECTILE_DAMAGE,
-          "fast"
-        );
-      }
-      boss.nextFastShotAt = time + BOSS_FAST_ATTACK_COOLDOWN_MS;
+    if (patterns[1] && time >= boss.nextSlowShotAt) {
+      this.executeBossPattern(boss, patterns[1], time, chaosEnabled);
+      boss.nextSlowShotAt = time + patterns[1].cooldownMs * (chaosEnabled && patterns.length > 2 ? 0.94 : 1);
+    }
+
+    if (patterns[2] && time >= boss.nextFastShotAt) {
+      this.executeBossPattern(boss, patterns[2], time, chaosEnabled);
+      boss.nextFastShotAt = time + patterns[2].cooldownMs * (chaosEnabled ? 0.88 : 1);
     }
   }
 
@@ -1189,6 +1308,113 @@ export class GameScene extends Phaser.Scene {
     bullet.lastHitTime = 0;
     bullet.trailTint = kind === "slow" ? 0xf7b27f : 0xf5e58d;
     bullet.nextTrailAt = this.time.now + 45;
+    bullet.weaponId = undefined;
+    bullet.explosiveRadius = 0;
+    bullet.explosiveDamage = 0;
+    bullet.appliesFire = false;
+    bullet.appliesPoison = false;
+    bullet.returnsAt = 0;
+    bullet.boomerangOwnerX = 0;
+    bullet.boomerangOwnerY = 0;
+    bullet.mineArmedAt = 0;
+    bullet.fragmentCount = 0;
+  }
+
+  private executeBossPattern(
+    boss: EnemySprite,
+    pattern: BossDef["attackPatterns"][number],
+    time: number,
+    chaosEnabled: boolean
+  ): void {
+    const aimAngle = Phaser.Math.Angle.Between(boss.x, boss.y, this.player.x, this.player.y);
+    const projectileType = pattern.projectileType ?? "fast";
+    const projectileSpeed = pattern.projectileSpeed ?? (projectileType === "slow" ? 220 : 350);
+    const projectileDamage = pattern.projectileDamage ?? 10;
+    const volleyCount = Math.max(1, pattern.volleyCount ?? 1) + (chaosEnabled ? 1 : 0);
+    const fanSpread = pattern.fanSpreadDeg ?? 28;
+
+    switch (pattern.kind) {
+      case "aimedVolley": {
+        const offsets = getProjectileSpreadAngles(volleyCount, fanSpread);
+        for (const offset of offsets) {
+          this.spawnEnemyBullet(
+            boss.x,
+            boss.y,
+            aimAngle + Phaser.Math.DegToRad(offset),
+            projectileSpeed,
+            projectileDamage,
+            projectileType
+          );
+        }
+        break;
+      }
+      case "radialBurst": {
+        for (let index = 0; index < volleyCount; index += 1) {
+          const angle = (Math.PI * 2 * index) / volleyCount;
+          this.spawnEnemyBullet(boss.x, boss.y, angle, projectileSpeed, projectileDamage, projectileType);
+        }
+        break;
+      }
+      case "charge": {
+        boss.chargeUntil = time + (pattern.chargeDurationMs ?? 650);
+        this.cameras.main.shake(140, 0.0018);
+        break;
+      }
+      case "teleportBurst": {
+        const point = this.getSafeSpawnPoint() ?? this.getFallbackSpawnPoint();
+        boss.setPosition(point.x, point.y);
+        const offsets = [45, 135, 225, 315];
+        for (const offset of offsets) {
+          this.spawnEnemyBullet(
+            boss.x,
+            boss.y,
+            Phaser.Math.DegToRad(offset),
+            projectileSpeed,
+            projectileDamage,
+            projectileType
+          );
+        }
+        break;
+      }
+      case "beamLane": {
+        this.spawnBeamHazard(boss.x, boss.y, aimAngle, pattern.beamWidth ?? 24, 420, pattern.beamDurationMs ?? 500, projectileDamage);
+        break;
+      }
+      case "poisonPool": {
+        this.spawnCircularHazard(this.player.x, this.player.y, pattern.areaRadius ?? 54, pattern.beamDurationMs ?? 2_200, projectileDamage * 0.5, 0x7ecd6d, "pool");
+        break;
+      }
+      case "lightningArc": {
+        const offsets = getProjectileSpreadAngles(volleyCount, 22);
+        for (const offset of offsets) {
+          this.spawnEnemyBullet(
+            boss.x,
+            boss.y,
+            aimAngle + Phaser.Math.DegToRad(offset),
+            projectileSpeed,
+            projectileDamage,
+            "fast"
+          );
+        }
+        this.spawnLightningTrace(boss.x, boss.y, this.player.x, this.player.y, 0xa8ecff);
+        break;
+      }
+      case "orbitingSatellite": {
+        const orbitCount = Math.max(2, pattern.orbitCount ?? 3) + (chaosEnabled ? 1 : 0);
+        for (let index = 0; index < orbitCount; index += 1) {
+          const orbitAngle = (Math.PI * 2 * index) / orbitCount + time * 0.0012;
+          const sx = boss.x + Math.cos(orbitAngle) * 42;
+          const sy = boss.y + Math.sin(orbitAngle) * 34;
+          const fireAngle = Phaser.Math.Angle.Between(sx, sy, this.player.x, this.player.y);
+          this.spawnEnemyBullet(sx, sy, fireAngle, projectileSpeed, projectileDamage, projectileType);
+        }
+        break;
+      }
+      case "slowFieldPulse": {
+        this.spawnCircularHazard(boss.x, boss.y, pattern.areaRadius ?? 120, 1_500, 2, 0x8eb9ff, "slowField", pattern.slowMultiplier ?? 0.55);
+        break;
+      }
+    }
   }
 
   private tryFireWeapons(time: number): void {
@@ -1209,7 +1435,7 @@ export class GameScene extends Phaser.Scene {
         return true;
       }
 
-      const didFire = this.fireWeapon(burst.weaponId, this.player.x, this.player.y, false);
+      const didFire = this.fireWeapon(burst.weaponId, burst.originX ?? this.player.x, burst.originY ?? this.player.y, false);
       burst.remainingShots -= 1;
       burst.nextShotAt = time + burst.intervalMs;
       return burst.remainingShots > 0 && didFire;
@@ -1224,34 +1450,127 @@ export class GameScene extends Phaser.Scene {
 
     const weapon = WEAPONS[weaponId];
     const aimAngle = Phaser.Math.Angle.Between(originX, originY, target.x, target.y);
-    const projectileCount = weapon.baseProjectiles + this.run.stats.extraProjectiles;
-    const spreadAngles = getProjectileSpreadAngles(projectileCount, weapon.spreadCapDeg, this.run.stats.spreadMultiplier);
     const critChance = Phaser.Math.Clamp(this.run.stats.critChance, 0, 0.85);
+    const projectileCount = Math.min(18, weapon.baseProjectiles + this.run.stats.extraProjectiles);
+    const spreadAngles = getProjectileSpreadAngles(projectileCount, weapon.spreadCapDeg, this.run.stats.spreadMultiplier);
+    const defaultDamage = (crit: boolean) =>
+      weapon.damage * this.run.stats.damageMultiplier * (crit ? this.run.stats.critDamageMultiplier : 1);
+    const spawnBallisticVolley = (
+      emittedAngles: number[],
+      overrides: Partial<{
+        speed: number;
+        damage: number;
+        pierce: number;
+        bounce: number;
+        scale: number;
+        explosiveRadius: number;
+        explosiveDamage: number;
+        lifetimeMs: number;
+        returnsAt: number;
+        mineArmedAt: number;
+        fragmentCount: number;
+        appliesFire: boolean;
+        appliesPoison: boolean;
+      }> = {}
+    ) => {
+      for (const spreadAngle of emittedAngles) {
+        const angle = aimAngle + Phaser.Math.DegToRad(spreadAngle);
+        const crit = Math.random() < critChance;
+        this.spawnFriendlyBullet({
+          weaponId,
+          x: originX + Math.cos(angle) * 28,
+          y: originY + Math.sin(angle) * 28,
+          angle,
+          speed: overrides.speed ?? weapon.projectileSpeed * this.run.stats.projectileSpeedMultiplier,
+          damage: overrides.damage ?? defaultDamage(crit),
+          tint: weapon.tint,
+          remainingPierce: overrides.pierce ?? (weapon.basePierce ?? 0) + this.run.stats.projectilePierce,
+          remainingBounce: overrides.bounce ?? this.run.stats.projectileBounce,
+          projectileScale: overrides.scale ?? (weapon.projectileScale ?? 1) * this.run.stats.projectileSizeMultiplier,
+          crit,
+          explosiveRadius: overrides.explosiveRadius ?? 0,
+          explosiveDamage: overrides.explosiveDamage ?? 0,
+          lifetimeMs: overrides.lifetimeMs ?? PLAYER_BULLET_LIFETIME_MS,
+          returnsAt: overrides.returnsAt ?? 0,
+          boomerangOwnerX: originX,
+          boomerangOwnerY: originY,
+          mineArmedAt: overrides.mineArmedAt ?? 0,
+          fragmentCount: overrides.fragmentCount ?? 0,
+          appliesFire: overrides.appliesFire ?? weapon.tags.includes("fire"),
+          appliesPoison: overrides.appliesPoison ?? weapon.tags.includes("poison")
+        });
+      }
+    };
 
-    for (const spreadAngle of spreadAngles) {
-      const angle = aimAngle + Phaser.Math.DegToRad(spreadAngle);
-      const crit = Math.random() < critChance;
-      this.spawnFriendlyBullet({
-        x: originX + Math.cos(angle) * 28,
-        y: originY + Math.sin(angle) * 28,
-        angle,
-        speed: weapon.projectileSpeed * this.run.stats.projectileSpeedMultiplier,
-        damage: weapon.damage * this.run.stats.damageMultiplier * (crit ? this.run.stats.critDamageMultiplier : 1),
-        tint: weapon.tint,
-        remainingPierce: (weapon.basePierce ?? 0) + this.run.stats.projectilePierce,
-        remainingBounce: this.run.stats.projectileBounce,
-        projectileScale: (weapon.projectileScale ?? 1) * this.run.stats.projectileSizeMultiplier,
-        crit
-      });
+    switch (weapon.behaviorKind) {
+      case "ballisticSingle":
+      case "pierceShot":
+      case "fanSpread":
+        spawnBallisticVolley(spreadAngles);
+        break;
+      case "ballisticBurst":
+        spawnBallisticVolley(spreadAngles);
+        break;
+      case "streamDot":
+        spawnBallisticVolley(
+          getProjectileSpreadAngles(Math.min(8, Math.max(2, projectileCount)), Math.max(weapon.spreadCapDeg, 20), this.run.stats.spreadMultiplier),
+          {
+            speed: weapon.projectileSpeed * this.run.stats.projectileSpeedMultiplier,
+            scale: (weapon.projectileScale ?? 1) * this.run.stats.projectileSizeMultiplier * 0.9,
+            lifetimeMs: weapon.behaviorConfig.shortLifetimeMs ?? 520,
+            appliesFire: weapon.tags.includes("fire"),
+            appliesPoison: weapon.tags.includes("poison")
+          }
+        );
+        break;
+      case "beam":
+        this.fireBeamWeapon(originX, originY, aimAngle, weapon);
+        break;
+      case "rocketOrGrenade":
+        spawnBallisticVolley(spreadAngles.slice(0, Math.min(3, spreadAngles.length)), {
+          speed: weapon.projectileSpeed * this.run.stats.projectileSpeedMultiplier,
+          explosiveRadius: weapon.behaviorConfig.explosionRadius ?? 38,
+          explosiveDamage: (weapon.behaviorConfig.explosionDamage ?? weapon.damage) * this.run.stats.damageMultiplier,
+          fragmentCount: weapon.id === "clusterLauncher" ? 3 : 0,
+          appliesPoison: weapon.tags.includes("acid") || weapon.tags.includes("poison"),
+          appliesFire: weapon.tags.includes("fire")
+        });
+        break;
+      case "mineDeploy":
+        this.spawnMine(originX, originY, aimAngle, weapon);
+        break;
+      case "orbitalHelper":
+        this.fireOrbitalWeapon(weapon, projectileCount);
+        break;
+      case "boomerangReturn":
+        spawnBallisticVolley(spreadAngles.slice(0, Math.min(4, spreadAngles.length)), {
+          returnsAt: this.time.now + (weapon.behaviorConfig.returnDelayMs ?? 320),
+          bounce: this.run.stats.projectileBounce + 1
+        });
+        break;
+      case "chainCaster":
+        this.fireChainCaster(originX, originY, target.x, target.y, weapon);
+        break;
+      case "novaBurst": {
+        const forwardCount = Math.max(6, weapon.behaviorConfig.novaCount ?? projectileCount);
+        const forwardAngles = getProjectileSpreadAngles(forwardCount, 46, this.run.stats.spreadMultiplier);
+        spawnBallisticVolley(forwardAngles, {
+          explosiveRadius: weapon.behaviorConfig.explosionRadius ?? 20,
+          explosiveDamage: (weapon.behaviorConfig.explosionDamage ?? weapon.damage * 0.75) * this.run.stats.damageMultiplier
+        });
+        break;
+      }
     }
 
     this.spawnMuzzleFlash(originX, originY, aimAngle, weapon.muzzleFlashTint);
-    if (allowBurst && (weapon.burstCount ?? 1) > 1 && weapon.burstIntervalMs) {
+    if (allowBurst && (weapon.behaviorConfig.burstCount ?? weapon.burstCount ?? 1) > 1 && (weapon.behaviorConfig.burstIntervalMs ?? weapon.burstIntervalMs)) {
       this.burstQueue.push({
         weaponId,
-        remainingShots: (weapon.burstCount ?? 1) - 1,
-        nextShotAt: this.time.now + weapon.burstIntervalMs,
-        intervalMs: weapon.burstIntervalMs
+        remainingShots: (weapon.behaviorConfig.burstCount ?? weapon.burstCount ?? 1) - 1,
+        nextShotAt: this.time.now + (weapon.behaviorConfig.burstIntervalMs ?? weapon.burstIntervalMs ?? 100),
+        intervalMs: weapon.behaviorConfig.burstIntervalMs ?? weapon.burstIntervalMs ?? 100,
+        originX,
+        originY
       });
     }
     this.audioController.fire(weapon.fireRateMs / this.run.stats.attackSpeedMultiplier);
@@ -1259,6 +1578,7 @@ export class GameScene extends Phaser.Scene {
   }
 
   private spawnFriendlyBullet(options: {
+    weaponId: WeaponId;
     x: number;
     y: number;
     angle: number;
@@ -1269,6 +1589,16 @@ export class GameScene extends Phaser.Scene {
     remainingBounce: number;
     projectileScale: number;
     crit: boolean;
+    explosiveRadius: number;
+    explosiveDamage: number;
+    lifetimeMs: number;
+    returnsAt: number;
+    boomerangOwnerX: number;
+    boomerangOwnerY: number;
+    mineArmedAt: number;
+    fragmentCount: number;
+    appliesFire: boolean;
+    appliesPoison: boolean;
   }): void {
     const bullet = this.playerBullets.get(options.x, options.y, "player-bullet") as BulletSprite | null;
     if (!bullet) {
@@ -1289,16 +1619,165 @@ export class GameScene extends Phaser.Scene {
     body.setAllowGravity(false);
     body.setVelocity(Math.cos(options.angle) * options.speed, Math.sin(options.angle) * options.speed);
     bullet.owner = "player";
+    bullet.weaponId = options.weaponId;
     bullet.damage = options.damage;
     bullet.knockback = 48 * this.run.stats.knockbackMultiplier;
-    bullet.expiresAt = this.time.now + PLAYER_BULLET_LIFETIME_MS;
+    bullet.expiresAt = this.time.now + options.lifetimeMs;
     bullet.remainingPierce = options.remainingPierce;
     bullet.remainingBounce = options.remainingBounce;
     bullet.crit = options.crit;
+    bullet.explosiveRadius = options.explosiveRadius;
+    bullet.explosiveDamage = options.explosiveDamage;
+    bullet.appliesFire = options.appliesFire;
+    bullet.appliesPoison = options.appliesPoison;
+    bullet.returnsAt = options.returnsAt;
+    bullet.boomerangOwnerX = options.boomerangOwnerX;
+    bullet.boomerangOwnerY = options.boomerangOwnerY;
+    bullet.mineArmedAt = options.mineArmedAt;
+    bullet.fragmentCount = options.fragmentCount;
     bullet.lastHitEnemyUid = -1;
     bullet.lastHitTime = 0;
     bullet.trailTint = options.tint;
-    bullet.nextTrailAt = this.time.now + 45;
+    bullet.nextTrailAt = options.speed <= 0.1 ? Number.POSITIVE_INFINITY : this.time.now + 45;
+  }
+
+  private fireBeamWeapon(originX: number, originY: number, angle: number, weapon: WeaponDef): void {
+    const beamLength = weapon.behaviorConfig.beamLength ?? 300;
+    const beamWidth = weapon.behaviorConfig.beamWidth ?? 18;
+    const endX = originX + Math.cos(angle) * beamLength;
+    const endY = originY + Math.sin(angle) * beamLength;
+    const beam = this.add.graphics().setDepth(17);
+    beam.lineStyle(beamWidth * 0.28, weapon.tint, 0.86);
+    beam.beginPath();
+    beam.moveTo(originX, originY);
+    beam.lineTo(endX, endY);
+    beam.strokePath();
+    this.tweens.add({
+      targets: beam,
+      alpha: 0,
+      duration: weapon.behaviorConfig.beamDurationMs ?? 100,
+      onComplete: () => beam.destroy()
+    });
+
+    for (const enemy of this.enemies.getChildren() as EnemySprite[]) {
+      if (!enemy.active) {
+        continue;
+      }
+
+      const distanceToLine = Phaser.Math.Distance.BetweenPoints(
+        new Phaser.Math.Vector2(enemy.x, enemy.y),
+        Phaser.Geom.Line.GetNearestPoint(new Phaser.Geom.Line(originX, originY, endX, endY), new Phaser.Math.Vector2(enemy.x, enemy.y))
+      );
+
+      if (distanceToLine > beamWidth + enemy.radiusValue) {
+        continue;
+      }
+
+      this.damageEnemy(enemy, weapon.damage * this.run.stats.damageMultiplier, Math.cos(angle), Math.sin(angle), 18, {
+        crit: false,
+        forceFire: weapon.tags.includes("fire"),
+        forcePoison: weapon.tags.includes("poison")
+      });
+    }
+  }
+
+  private spawnMine(originX: number, originY: number, angle: number, weapon: WeaponDef): void {
+    this.spawnFriendlyBullet({
+      weaponId: weapon.id,
+      x: originX + Math.cos(angle) * 18,
+      y: originY + Math.sin(angle) * 18,
+      angle,
+      speed: 0,
+      damage: weapon.damage * this.run.stats.damageMultiplier,
+      tint: weapon.tint,
+      remainingPierce: 0,
+      remainingBounce: 0,
+      projectileScale: 1.1,
+      crit: false,
+      explosiveRadius: weapon.behaviorConfig.explosionRadius ?? 52,
+      explosiveDamage: (weapon.behaviorConfig.explosionDamage ?? weapon.damage * 1.5) * this.run.stats.damageMultiplier,
+      lifetimeMs: weapon.behaviorConfig.mineLifetimeMs ?? 4_800,
+      returnsAt: 0,
+      boomerangOwnerX: originX,
+      boomerangOwnerY: originY,
+      mineArmedAt: this.time.now + (weapon.behaviorConfig.mineArmMs ?? 550),
+      fragmentCount: 0,
+      appliesFire: false,
+      appliesPoison: false
+    });
+  }
+
+  private fireOrbitalWeapon(weapon: WeaponDef, projectileCount: number): void {
+    const helperCount = Math.min(weapon.behaviorConfig.helperCap ?? 2, weapon.behaviorConfig.helperCount ?? 1);
+    for (let index = 0; index < helperCount; index += 1) {
+      const orbitAngle = this.time.now * 0.002 + (Math.PI * 2 * index) / Math.max(1, helperCount);
+      const radius = (weapon.behaviorConfig.helperRadius ?? 68) + index * 8;
+      const originX = this.player.x + Math.cos(orbitAngle) * radius;
+      const originY = this.player.y + Math.sin(orbitAngle) * radius * 0.8;
+      const target = this.getNearestEnemyTarget();
+      if (!target) {
+        continue;
+      }
+      const aimAngle = Phaser.Math.Angle.Between(originX, originY, target.x, target.y);
+      const spreadAngles = getProjectileSpreadAngles(Math.min(6, Math.max(1, projectileCount)), weapon.spreadCapDeg, this.run.stats.spreadMultiplier);
+      for (const spreadAngle of spreadAngles.slice(0, Math.min(4, spreadAngles.length))) {
+        const angle = aimAngle + Phaser.Math.DegToRad(spreadAngle);
+        this.spawnFriendlyBullet({
+          weaponId: weapon.id,
+          x: originX,
+          y: originY,
+          angle,
+          speed: Math.max(520, weapon.projectileSpeed * this.run.stats.projectileSpeedMultiplier),
+          damage: weapon.damage * this.run.stats.damageMultiplier,
+          tint: weapon.tint,
+          remainingPierce: weapon.basePierce ?? 0,
+          remainingBounce: 0,
+          projectileScale: (weapon.projectileScale ?? 1) * this.run.stats.projectileSizeMultiplier,
+          crit: false,
+          explosiveRadius: 0,
+          explosiveDamage: 0,
+          lifetimeMs: PLAYER_BULLET_LIFETIME_MS,
+          returnsAt: 0,
+          boomerangOwnerX: originX,
+          boomerangOwnerY: originY,
+          mineArmedAt: 0,
+          fragmentCount: 0,
+          appliesFire: false,
+          appliesPoison: false
+        });
+      }
+      this.spawnMuzzleFlash(originX, originY, aimAngle, weapon.muzzleFlashTint, 0.62);
+    }
+  }
+
+  private fireChainCaster(originX: number, originY: number, targetX: number, targetY: number, weapon: WeaponDef): void {
+    const nearest = this.getNearestEnemyTarget();
+    if (!nearest) {
+      return;
+    }
+
+    this.spawnLightningTrace(originX, originY, targetX, targetY, weapon.tint);
+    this.damageEnemy(nearest, weapon.damage * this.run.stats.damageMultiplier, targetX - originX, targetY - originY, 0, {
+      forceFire: false,
+      forcePoison: false
+    });
+
+    const extraTargets = Math.max(2, weapon.behaviorConfig.chainTargets ?? 3);
+    const damageMultiplier = weapon.behaviorConfig.chainDamageMultiplier ?? 0.65;
+    const chainRange = weapon.behaviorConfig.chainRange ?? CHAIN_LIGHTNING_RANGE;
+    const nearby = (this.enemies.getChildren() as EnemySprite[])
+      .filter((enemy) => enemy.active && enemy.uid !== nearest.uid)
+      .map((enemy) => ({ enemy, distance: Phaser.Math.Distance.Between(enemy.x, enemy.y, nearest.x, nearest.y) }))
+      .filter((entry) => entry.distance <= chainRange)
+      .sort((a, b) => a.distance - b.distance)
+      .slice(0, extraTargets);
+
+    nearby.forEach(({ enemy }) => {
+      this.spawnLightningTrace(nearest.x, nearest.y, enemy.x, enemy.y, weapon.tint);
+      this.damageEnemy(enemy, weapon.damage * this.run.stats.damageMultiplier * damageMultiplier, 0, 0, 0, {
+        allowChain: false
+      });
+    });
   }
 
   private updateProjectiles(time: number): void {
@@ -1328,12 +1807,25 @@ export class GameScene extends Phaser.Scene {
             scaleX: trail.scaleX * 0.45,
             scaleY: trail.scaleY * 0.45,
             duration: 150,
-            onComplete: () => trail.destroy()
-          });
+          onComplete: () => trail.destroy()
+        });
+      }
+
+        if (bullet.owner === "player" && bullet.returnsAt > 0 && time >= bullet.returnsAt) {
+          const body = this.getBody(bullet);
+          const angle = Phaser.Math.Angle.Between(bullet.x, bullet.y, this.player.x, this.player.y);
+          const speed = Math.max(320, body.velocity.length());
+          body.setVelocity(Math.cos(angle) * speed, Math.sin(angle) * speed);
+          bullet.setRotation(angle);
+          bullet.returnsAt = 0;
         }
 
         if (outside || time >= bullet.expiresAt) {
-          this.disableProjectile(bullet);
+          if (bullet.owner === "player" && bullet.explosiveRadius > 0) {
+            this.explodePlayerProjectile(bullet, bullet.x, bullet.y);
+          } else {
+            this.disableProjectile(bullet);
+          }
         }
       }
     }
@@ -1362,19 +1854,31 @@ export class GameScene extends Phaser.Scene {
         return;
       }
 
-      drone.nextShotAt = time + DRONE_FIRE_RATE_MS;
+      const fireRate = this.run.activeSynergyIds.includes("droneOverclock") ? DRONE_FIRE_RATE_MS * 0.72 : DRONE_FIRE_RATE_MS;
+      drone.nextShotAt = time + fireRate;
       const angle = Phaser.Math.Angle.Between(drone.x, drone.y, target.x, target.y);
       this.spawnFriendlyBullet({
+        weaponId: "droneGun",
         x: drone.x + Math.cos(angle) * 16,
         y: drone.y + Math.sin(angle) * 16,
         angle,
         speed: 620,
-        damage: 1.25 * this.run.stats.damageMultiplier,
+        damage: (this.run.activeSynergyIds.includes("droneOverclock") ? 1.7 : 1.25) * this.run.stats.damageMultiplier,
         tint: 0xc5f0ff,
         remainingPierce: 0,
         remainingBounce: 0,
         projectileScale: 0.9,
-        crit: false
+        crit: false,
+        explosiveRadius: 0,
+        explosiveDamage: 0,
+        lifetimeMs: PLAYER_BULLET_LIFETIME_MS,
+        returnsAt: 0,
+        boomerangOwnerX: drone.x,
+        boomerangOwnerY: drone.y,
+        mineArmedAt: 0,
+        fragmentCount: 0,
+        appliesFire: false,
+        appliesPoison: false
       });
       this.spawnMuzzleFlash(drone.x, drone.y, angle, 0xd7f5ff, 0.75);
     });
@@ -1475,6 +1979,7 @@ export class GameScene extends Phaser.Scene {
     this.playerInvulnerableUntil += pausedDuration;
     this.playerFlashUntil += pausedDuration;
     this.run.bannerUntil += pausedDuration;
+    this.run.nextBurstAt += pausedDuration;
     this.run.notifications = this.run.notifications.map((notification) => ({
       ...notification,
       createdAt: notification.createdAt + pausedDuration,
@@ -1521,6 +2026,11 @@ export class GameScene extends Phaser.Scene {
     for (const text of this.floatingTexts) {
       text.expiresAt += pausedDuration;
     }
+    this.playerSlowUntil += pausedDuration;
+    for (const hazard of this.hazards) {
+      hazard.nextTickAt += pausedDuration;
+      hazard.expiresAt += pausedDuration;
+    }
   }
 
   private openLevelUpDraft(time: number, fromLive: boolean): void {
@@ -1561,9 +2071,11 @@ export class GameScene extends Phaser.Scene {
 
   private selectUpgrade(choice: UpgradeDef): void {
     const oldStats = this.run.stats;
+    const oldSynergies = new Set(this.run.activeSynergyIds);
     this.run.activeUpgrades[choice.id] = (this.run.activeUpgrades[choice.id] ?? 0) + 1;
     this.run.pendingLevelUps = Math.max(0, this.run.pendingLevelUps - 1);
-    this.run.stats = buildPlayerStats(this.run.activeUpgrades, this.selectedCharacterId);
+    this.run.activeSynergyIds = getActiveSynergyIds(this.run.activeUpgrades);
+    this.run.stats = buildPlayerStats(this.run.activeUpgrades, this.selectedCharacterId, this.run.activeSynergyIds);
     const maxHpIncrease = this.run.stats.maxHp - oldStats.maxHp;
     if (maxHpIncrease > 0) {
       this.run.hp = Math.min(this.run.stats.maxHp, this.run.hp + maxHpIncrease);
@@ -1575,6 +2087,12 @@ export class GameScene extends Phaser.Scene {
     }
     this.syncDroneCount(this.time.now);
     this.pushNotification(choice.label, choice.accent, this.time.now);
+    this.run.activeSynergyIds
+      .filter((synergyId) => !oldSynergies.has(synergyId))
+      .forEach((synergyId) => {
+        const synergy = SYNERGY_BY_ID[synergyId];
+        this.pushNotification(`Synergy: ${synergy.label}`, synergy.accent, this.time.now);
+      });
     this.clearOverlay();
 
     if (this.run.pendingLevelUps > 0) {
@@ -1591,7 +2109,11 @@ export class GameScene extends Phaser.Scene {
   }
 
   private openWeaponDraft(phase: number): void {
-    const choices = drawWeaponChoices(WEAPON_ORDER, WEAPON_DRAFT_CARD_COUNT);
+    const choices = drawWeaponChoices(
+      phase,
+      this.run.equippedWeapons.map((weapon) => weapon.weaponId),
+      WEAPON_DRAFT_CARD_COUNT
+    );
     this.run.weaponDraftOffer = { phase, choices };
     this.run.flowMode = "weaponDraft";
     this.clearOverlay();
@@ -1639,15 +2161,25 @@ export class GameScene extends Phaser.Scene {
     if (bullet.lastHitEnemyUid === enemy.uid && this.time.now - bullet.lastHitTime < 80) {
       return;
     }
+    if (bullet.mineArmedAt > this.time.now) {
+      return;
+    }
 
     const body = this.getBody(bullet);
     this.damageEnemy(enemy, bullet.damage, body.velocity.x, body.velocity.y, bullet.knockback, {
-      crit: bullet.crit
+      crit: bullet.crit,
+      forceFire: bullet.appliesFire,
+      forcePoison: bullet.appliesPoison
     });
     bullet.lastHitEnemyUid = enemy.uid;
     bullet.lastHitTime = this.time.now;
 
     if (!bullet.active) {
+      return;
+    }
+
+    if (bullet.explosiveRadius > 0) {
+      this.explodePlayerProjectile(bullet, enemy.x, enemy.y);
       return;
     }
 
@@ -1658,6 +2190,9 @@ export class GameScene extends Phaser.Scene {
 
     if (bullet.remainingBounce > 0 && this.tryBounceProjectile(bullet, enemy)) {
       bullet.remainingBounce -= 1;
+      if (this.run.activeSynergyIds.includes("toxicRicochet")) {
+        bullet.appliesPoison = true;
+      }
       bullet.remainingPierce = 0;
       return;
     }
@@ -1719,17 +2254,23 @@ export class GameScene extends Phaser.Scene {
       }
     }
 
+    const lifeStealMultiplier = this.run.activeSynergyIds.includes("vampiricBarrage") ? 1.5 : 1;
     if (config.allowLifeSteal && this.run.stats.lifeSteal > 0) {
-      this.healPlayer(damage * this.run.stats.lifeSteal);
+      this.healPlayer(damage * this.run.stats.lifeSteal * lifeStealMultiplier);
     }
 
-    if (config.applyStatus && this.run.stats.fireDurationMs > 0 && this.run.stats.fireDps > 0) {
-      enemy.burnUntil = Math.max(enemy.burnUntil, this.time.now + this.run.stats.fireDurationMs);
+    const shouldApplyFire = config.forceFire || (config.applyStatus && this.run.stats.fireDurationMs > 0 && this.run.stats.fireDps > 0);
+    const shouldApplyPoison = config.forcePoison || (config.applyStatus && this.run.stats.poisonDurationMs > 0 && this.run.stats.poisonDps > 0);
+
+    if (shouldApplyFire && (this.run.stats.fireDps > 0 || config.forceFire)) {
+      const fireDuration = config.forceFire ? Math.max(this.run.stats.fireDurationMs, 1_800) : this.run.stats.fireDurationMs;
+      enemy.burnUntil = Math.max(enemy.burnUntil, this.time.now + fireDuration);
       enemy.nextBurnTickAt = this.time.now + FIRE_TICK_MS;
     }
 
-    if (config.applyStatus && this.run.stats.poisonDurationMs > 0 && this.run.stats.poisonDps > 0) {
-      enemy.poisonUntil = Math.max(enemy.poisonUntil, this.time.now + this.run.stats.poisonDurationMs);
+    if (shouldApplyPoison && (this.run.stats.poisonDps > 0 || config.forcePoison)) {
+      const poisonDuration = config.forcePoison ? Math.max(this.run.stats.poisonDurationMs, 2_400) : this.run.stats.poisonDurationMs;
+      enemy.poisonUntil = Math.max(enemy.poisonUntil, this.time.now + poisonDuration);
       enemy.nextPoisonTickAt = this.time.now + POISON_TICK_MS;
     }
 
@@ -1785,12 +2326,13 @@ export class GameScene extends Phaser.Scene {
 
   private spawnXpDrops(enemy: EnemySprite): void {
     if (enemy.enemyType === "boss") {
-      for (let index = 0; index < BOSS_XP_ORB_COUNT; index += 1) {
-        const angle = (Math.PI * 2 * index) / BOSS_XP_ORB_COUNT;
+      const boss = enemy.bossId ? BOSSES[enemy.bossId] : BOSSES.titan;
+      for (let index = 0; index < boss.xpOrbCount; index += 1) {
+        const angle = (Math.PI * 2 * index) / boss.xpOrbCount;
         this.spawnXpOrb(
           enemy.x + Math.cos(angle) * 18,
           enemy.y + Math.sin(angle) * 18,
-          BOSS_XP_ORB_VALUE
+          boss.xpOrbValue
         );
       }
       return;
@@ -1862,6 +2404,67 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
+  private explodePlayerProjectile(projectile: BulletSprite, x: number, y: number): void {
+    const radius = projectile.explosiveRadius;
+    const damage = projectile.explosiveDamage > 0 ? projectile.explosiveDamage : projectile.damage;
+    this.disableProjectile(projectile);
+    this.spawnParticleBurst(x, y, 10, projectile.trailTint || 0xffb263);
+    this.cameras.main.shake(70, 0.0014);
+    this.damageEnemiesInRadius(x, y, radius, damage, projectile);
+
+    if (projectile.fragmentCount > 0 || this.run.activeSynergyIds.includes("blastFragmentation")) {
+      const fragments = Math.min(8, projectile.fragmentCount + (this.run.activeSynergyIds.includes("blastFragmentation") ? 3 : 0));
+      for (let index = 0; index < fragments; index += 1) {
+        const angle = (Math.PI * 2 * index) / Math.max(1, fragments);
+        this.spawnFriendlyBullet({
+          weaponId: projectile.weaponId ?? "pistol",
+          x,
+          y,
+          angle,
+          speed: 420,
+          damage: Math.max(0.8, damage * 0.35),
+          tint: projectile.trailTint,
+          remainingPierce: 0,
+          remainingBounce: 0,
+          projectileScale: 0.7,
+          crit: false,
+          explosiveRadius: 0,
+          explosiveDamage: 0,
+          lifetimeMs: 480,
+          returnsAt: 0,
+          boomerangOwnerX: x,
+          boomerangOwnerY: y,
+          mineArmedAt: 0,
+          fragmentCount: 0,
+          appliesFire: projectile.appliesFire,
+          appliesPoison: projectile.appliesPoison
+        });
+      }
+    }
+  }
+
+  private damageEnemiesInRadius(x: number, y: number, radius: number, damage: number, source?: BulletSprite): void {
+    for (const enemy of this.enemies.getChildren() as EnemySprite[]) {
+      if (!enemy.active) {
+        continue;
+      }
+
+      const distance = Phaser.Math.Distance.Between(enemy.x, enemy.y, x, y);
+      if (distance > radius) {
+        continue;
+      }
+
+      this.damageEnemy(enemy, damage, enemy.x - x, enemy.y - y, 24, {
+        applyStatus: true,
+        allowLifeSteal: false,
+        allowChain: false,
+        allowExplosion: false,
+        forceFire: source?.appliesFire ?? false,
+        forcePoison: source?.appliesPoison ?? false
+      });
+    }
+  }
+
   private tryBounceProjectile(projectile: BulletSprite, fromEnemy: EnemySprite): boolean {
     if (projectile.remainingBounce <= 0) {
       return false;
@@ -1881,10 +2484,14 @@ export class GameScene extends Phaser.Scene {
     const body = this.getBody(projectile);
     const speed = body.velocity.length();
     const angle = Phaser.Math.Angle.Between(projectile.x, projectile.y, target.x, target.y);
-    body.setVelocity(Math.cos(angle) * speed, Math.sin(angle) * speed);
+    const nextSpeed = this.run.activeSynergyIds.includes("piercingRicochet") ? speed * 1.08 : speed;
+    body.setVelocity(Math.cos(angle) * nextSpeed, Math.sin(angle) * nextSpeed);
     projectile.setRotation(angle);
     projectile.lastHitEnemyUid = -1;
     projectile.lastHitTime = 0;
+    if (this.run.activeSynergyIds.includes("piercingRicochet")) {
+      projectile.remainingPierce = Math.max(projectile.remainingPierce, 1);
+    }
     return true;
   }
 
@@ -1903,34 +2510,27 @@ export class GameScene extends Phaser.Scene {
         applyStatus: false,
         allowLifeSteal: false,
         allowChain: false,
-        allowExplosion: false
+        allowExplosion: false,
+        forceFire: this.run.activeSynergyIds.includes("fireExplosion") || this.run.activeSynergyIds.includes("toxicFirestorm"),
+        forcePoison: this.run.activeSynergyIds.includes("toxicFirestorm")
       });
     }
   }
 
   private triggerChainLightning(sourceEnemy: EnemySprite, baseDamage: number, time: number): void {
+    const bonusTargets = this.run.activeSynergyIds.includes("critStorm") ? 1 : 0;
+    const bonusDamage = this.run.activeSynergyIds.includes("critStorm") ? 0.2 : 0;
     const targets = (this.enemies.getChildren() as EnemySprite[])
       .filter((enemy) => enemy.active && enemy.uid !== sourceEnemy.uid)
       .map((enemy) => ({ enemy, distance: Phaser.Math.Distance.Between(enemy.x, enemy.y, sourceEnemy.x, sourceEnemy.y) }))
       .filter((entry) => entry.distance <= CHAIN_LIGHTNING_RANGE)
       .sort((a, b) => a.distance - b.distance)
-      .slice(0, Math.max(0, Math.floor(this.run.stats.chainLightningTargets)))
+      .slice(0, Math.max(0, Math.floor(this.run.stats.chainLightningTargets + bonusTargets)))
       .map((entry) => entry.enemy);
 
     for (const target of targets) {
-      const bolt = this.add.graphics().setDepth(19);
-      bolt.lineStyle(2, 0x94ecff, 0.9);
-      bolt.beginPath();
-      bolt.moveTo(sourceEnemy.x, sourceEnemy.y);
-      bolt.lineTo(target.x, target.y);
-      bolt.strokePath();
-      this.tweens.add({
-        targets: bolt,
-        alpha: 0,
-        duration: 110,
-        onComplete: () => bolt.destroy()
-      });
-      this.damageEnemy(target, baseDamage * this.run.stats.chainLightningDamageMultiplier, 0, 0, 0, {
+      this.spawnLightningTrace(sourceEnemy.x, sourceEnemy.y, target.x, target.y, 0x94ecff);
+      this.damageEnemy(target, baseDamage * (this.run.stats.chainLightningDamageMultiplier + bonusDamage), 0, 0, 0, {
         applyStatus: false,
         allowLifeSteal: false,
         allowChain: false,
@@ -1971,6 +2571,146 @@ export class GameScene extends Phaser.Scene {
     this.createActionButton(VIEW_WIDTH / 2, VIEW_HEIGHT / 2 + 102, 280, 58, "RESTART RUN", 0xc3df95, () =>
       this.startRun(this.selectedCharacterId)
     );
+  }
+
+  private spawnLightningTrace(x1: number, y1: number, x2: number, y2: number, tint: number): void {
+    const bolt = this.add.graphics().setDepth(19);
+    bolt.lineStyle(2, tint, 0.92);
+    bolt.beginPath();
+    bolt.moveTo(x1, y1);
+    bolt.lineTo((x1 + x2) / 2 + Phaser.Math.Between(-8, 8), (y1 + y2) / 2 + Phaser.Math.Between(-8, 8));
+    bolt.lineTo(x2, y2);
+    bolt.strokePath();
+    this.tweens.add({
+      targets: bolt,
+      alpha: 0,
+      duration: 110,
+      onComplete: () => bolt.destroy()
+    });
+  }
+
+  private spawnCircularHazard(
+    x: number,
+    y: number,
+    radius: number,
+    durationMs: number,
+    damagePerTick: number,
+    tint: number,
+    kind: ActiveHazard["kind"],
+    slowMultiplier?: number
+  ): void {
+    const gfx = this.add.graphics().setDepth(9);
+    gfx.lineStyle(2, tint, 0.8);
+    gfx.fillStyle(tint, 0.12);
+    gfx.fillCircle(x, y, radius);
+    gfx.strokeCircle(x, y, radius);
+    this.hazards.push({
+      id: this.hazardIdCounter++,
+      kind,
+      x,
+      y,
+      radius,
+      damagePerTick,
+      slowMultiplier,
+      nextTickAt: this.time.now + 250,
+      expiresAt: this.time.now + durationMs,
+      gfx
+    });
+    this.tweens.add({
+      targets: gfx,
+      alpha: 0.3,
+      duration: durationMs,
+      onComplete: () => gfx.destroy()
+    });
+  }
+
+  private spawnBeamHazard(
+    x: number,
+    y: number,
+    angle: number,
+    width: number,
+    length: number,
+    durationMs: number,
+    damagePerTick: number
+  ): void {
+    const gfx = this.add.graphics().setDepth(10);
+    const endX = x + Math.cos(angle) * length;
+    const endY = y + Math.sin(angle) * length;
+    gfx.lineStyle(width * 0.35, 0xf0c18f, 0.55);
+    gfx.beginPath();
+    gfx.moveTo(x, y);
+    gfx.lineTo(endX, endY);
+    gfx.strokePath();
+    this.hazards.push({
+      id: this.hazardIdCounter++,
+      kind: "beam",
+      x,
+      y,
+      radius: width,
+      angle,
+      width,
+      length,
+      damagePerTick,
+      nextTickAt: this.time.now + 180,
+      expiresAt: this.time.now + durationMs,
+      gfx
+    });
+    this.tweens.add({
+      targets: gfx,
+      alpha: 0.15,
+      duration: durationMs,
+      onComplete: () => gfx.destroy()
+    });
+  }
+
+  private updateHazards(time: number): void {
+    this.hazards = this.hazards.filter((hazard) => {
+      if (time >= hazard.expiresAt) {
+        hazard.gfx.destroy();
+        return false;
+      }
+
+      if (hazard.kind === "pool" || hazard.kind === "slowField") {
+        hazard.gfx.setAlpha(0.16 + Math.sin(time * 0.01 + hazard.id) * 0.08);
+        const distance = Phaser.Math.Distance.Between(hazard.x, hazard.y, this.player.x, this.player.y);
+        if (hazard.kind === "slowField" && distance <= hazard.radius) {
+          this.playerSlowUntil = Math.max(this.playerSlowUntil, time + 120);
+          this.playerSlowMultiplier = Math.min(this.playerSlowMultiplier, hazard.slowMultiplier ?? 0.55);
+        }
+        if (time >= hazard.nextTickAt) {
+          hazard.nextTickAt = time + 250;
+          if (distance <= hazard.radius) {
+            this.damagePlayer(hazard.damagePerTick);
+          }
+        }
+        return true;
+      }
+
+      const endX = hazard.x + Math.cos(hazard.angle ?? 0) * (hazard.length ?? 0);
+      const endY = hazard.y + Math.sin(hazard.angle ?? 0) * (hazard.length ?? 0);
+      const nearest = Phaser.Geom.Line.GetNearestPoint(new Phaser.Geom.Line(hazard.x, hazard.y, endX, endY), new Phaser.Math.Vector2(this.player.x, this.player.y));
+      const distance = Phaser.Math.Distance.Between(this.player.x, this.player.y, nearest.x, nearest.y);
+      if (time >= hazard.nextTickAt) {
+        hazard.nextTickAt = time + 180;
+        if (distance <= (hazard.width ?? hazard.radius)) {
+          this.damagePlayer(hazard.damagePerTick);
+        }
+      }
+      return true;
+    });
+
+    if (time >= this.playerSlowUntil) {
+      this.playerSlowMultiplier = 1;
+    }
+  }
+
+  private clearHazards(): void {
+    for (const hazard of this.hazards) {
+      hazard.gfx.destroy();
+    }
+    this.hazards = [];
+    this.playerSlowUntil = 0;
+    this.playerSlowMultiplier = 1;
   }
 
   private updatePlayerFlash(time: number): void {
@@ -2221,19 +2961,38 @@ export class GameScene extends Phaser.Scene {
   private createWeaponPreview(panel: Phaser.GameObjects.Container, weapon: WeaponDef): void {
     const previewBg = this.add.rectangle(0, 82, 154, 42, 0x101513, 0.9).setStrokeStyle(1, weapon.tint, 0.6);
     const muzzle = this.add.image(-44, 82, "muzzle-flash").setTint(weapon.muzzleFlashTint).setScale(0.45).setAlpha(0.1);
-    const trail = this.add.rectangle(-34, 82, 8, 3, weapon.tint, 0.8).setOrigin(0.5);
+    const trail =
+      weapon.previewPattern === "beam"
+        ? this.add.rectangle(6, 82, 74, 6, weapon.tint, 0.6).setOrigin(0, 0.5)
+        : weapon.previewPattern === "orbit"
+          ? this.add.circle(0, 82, 4, weapon.tint, 1)
+          : this.add.rectangle(-34, 82, 8, 3, weapon.tint, 0.8).setOrigin(0.5);
     panel.add([previewBg, trail, muzzle]);
-    this.tweens.add({
-      targets: trail,
-      x: 40,
-      alpha: 0,
-      duration: WEAPON_PREVIEW_LOOP_MS * 0.55,
-      repeat: -1,
-      onRepeat: () => {
-        trail.x = -34;
-        trail.alpha = 0.9;
-      }
-    });
+
+    if (weapon.previewPattern === "orbit") {
+      this.tweens.add({
+        targets: trail,
+        duration: WEAPON_PREVIEW_LOOP_MS,
+        repeat: -1,
+        onUpdate: () => {
+          const progress = ((this.time.now % WEAPON_PREVIEW_LOOP_MS) / WEAPON_PREVIEW_LOOP_MS) * Math.PI * 2;
+          trail.x = Math.cos(progress) * 28;
+          trail.y = 82 + Math.sin(progress) * 12;
+        }
+      });
+    } else {
+      this.tweens.add({
+        targets: trail,
+        x: weapon.previewPattern === "beam" ? 34 : 40,
+        alpha: 0,
+        duration: WEAPON_PREVIEW_LOOP_MS * 0.55,
+        repeat: -1,
+        onRepeat: () => {
+          trail.x = weapon.previewPattern === "beam" ? 6 : -34;
+          trail.alpha = 0.9;
+        }
+      });
+    }
     this.tweens.add({
       targets: muzzle,
       alpha: { from: 0.95, to: 0.1 },
