@@ -1,0 +1,42 @@
+:root {
+  color-scheme: dark;
+  font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+  background:
+    radial-gradient(circle at top, rgba(216, 232, 219, 0.09), transparent 32%),
+    linear-gradient(180deg, #5f726b 0%, #485852 100%);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  min-height: 100%;
+  width: 100%;
+}
+
+body {
+  overflow: hidden;
+}
+
+#app {
+  min-height: 100vh;
+  min-height: 100svh;
+  display: grid;
+  place-items: center;
+  padding: clamp(12px, 2vw, 24px);
+}
+
+canvas {
+  display: block;
+  width: min(100%, calc(100svh * 1.7777778));
+  height: auto;
+  max-height: calc(100svh - clamp(12px, 2vw, 24px) * 2);
+  border: 2px solid rgba(255, 255, 255, 0.2);
+  box-shadow:
+    0 24px 60px rgba(13, 16, 16, 0.48),
+    0 0 0 1px rgba(255, 255, 255, 0.06);
+}
