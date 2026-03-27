@@ -12,7 +12,9 @@ import {
   ENEMIES,
   ENEMY_BULLET_LIFETIME_MS,
   FIRE_TICK_MS,
-  LEVEL_UP_CARD_COUNT,
+  ITEM_BY_ID,
+  ITEM_CARD_COUNT,
+  ITEM_RARITIES,
   MAX_PENDING_SPAWNS,
   NOTIFICATION_DURATION_MS,
   PHASE_COMPLETE_DURATION_MS,
@@ -28,35 +30,40 @@ import {
   SPAWN_POINT_MARGIN,
   SPAWN_SAFE_RADIUS,
   SPAWN_TELEGRAPH_MS,
-  STARTING_WEAPON,
   VIEW_HEIGHT,
   VIEW_WIDTH,
   WEAPON_DRAFT_CARD_COUNT,
   WEAPON_PREVIEW_LOOP_MS,
+  WEAPON_RARITIES,
   WEAPONS,
   WEAPON_ORDER,
   XP_TOUCH_RADIUS
 } from "./config";
 import { SYNERGY_BY_ID } from "./config/synergies";
-import { UPGRADE_POOL } from "./config/upgrades";
 import {
   appendEquippedWeapon,
   awardXpProgress,
+  buildDerivedRunStats,
+  buildItemOfferContext,
   buildPhaseRewardQueue,
   buildPlayerStats,
   chooseEnemyType,
+  createItemInstance,
   createEquippedWeapon,
+  drawItemChoices,
   drawWeaponChoices,
   findNearestTarget,
   getActiveSynergyIds,
+  getBossCountForBossPhase,
   getBossHealthMultiplier,
   getBossIdForPhase,
   getBurstWaveCount,
   getBurstWaveInterval,
   getEnemyHealthMultiplier,
   getEnemySpeedMultiplier,
+  getPhaseRecoveryWindowMs,
   getPhaseEnemyCap,
-  drawUpgradeChoices,
+  getDominantBuildTags,
   getProjectileSpreadAngles,
   getReadyWeapons,
   getXpToNextLevel,
@@ -71,15 +78,15 @@ import type {
   BossId,
   CharacterId,
   EnemyId,
+  ItemCategory,
+  ItemOfferChoice,
+  ItemRarity,
   Notification,
   PendingSpawn,
   PersistentProfile,
   RunState,
   SynergyId,
   TargetLike,
-  UpgradeCategory,
-  UpgradeDef,
-  UpgradeId,
   WeaponDef,
   WeaponDraftOffer,
   WeaponId
@@ -87,7 +94,7 @@ import type {
 
 export { VIEW_HEIGHT, VIEW_WIDTH } from "./config";
 
-type Keys = Record<"w" | "a" | "s" | "d" | "space" | "enter" | "one" | "two" | "three", Phaser.Input.Keyboard.Key>;
+type Keys = Record<"w" | "a" | "s" | "d" | "space" | "enter" | "escape" | "tab" | "one" | "two" | "three", Phaser.Input.Keyboard.Key>;
 
 interface EnemySprite extends Phaser.Physics.Arcade.Image, TargetLike {
   uid: number;
@@ -213,7 +220,11 @@ export class GameScene extends Phaser.Scene {
   private enemyCountText!: Phaser.GameObjects.Text;
   private hintText!: Phaser.GameObjects.Text;
   private bannerText!: Phaser.GameObjects.Text;
+  private buildSummaryText!: Phaser.GameObjects.Text;
   private weaponStripContainer!: Phaser.GameObjects.Container;
+  private statsButtonPanel!: Phaser.GameObjects.Rectangle;
+  private statsButtonText!: Phaser.GameObjects.Text;
+  private hudFrameElements: Phaser.GameObjects.GameObject[] = [];
   private overlayElements: Phaser.GameObjects.GameObject[] = [];
   private activeChoiceActions: Array<() => void> = [];
   private floatingTexts: FloatingText[] = [];
@@ -233,6 +244,7 @@ export class GameScene extends Phaser.Scene {
   private burstQueue: QueuedBurst[] = [];
   private spawnMarkers = new Map<number, Phaser.GameObjects.Image>();
   private selectedCharacterId: CharacterId = "soldier";
+  private menuScreen: "main" | "about" | "settings" = "main";
   private drones: DroneSprite[] = [];
   private hazards: ActiveHazard[] = [];
   private livePauseStartedAt: number | null = null;
@@ -264,7 +276,16 @@ export class GameScene extends Phaser.Scene {
     this.updateNotificationsUi(time);
     this.handleChoiceInput();
 
+    if (this.run.flowMode === "mainMenu") {
+      this.updateHud(time);
+      return;
+    }
+
     if (this.run.flowMode === "characterSelect") {
+      if (Phaser.Input.Keyboard.JustDown(this.keys.escape)) {
+        this.openMainMenu();
+        return;
+      }
       if (Phaser.Input.Keyboard.JustDown(this.keys.space) || Phaser.Input.Keyboard.JustDown(this.keys.enter)) {
         this.startRun(this.selectedCharacterId);
       }
@@ -288,7 +309,21 @@ export class GameScene extends Phaser.Scene {
       return;
     }
 
-    if (this.run.flowMode === "levelUp" || this.run.flowMode === "weaponDraft") {
+    if (this.run.flowMode === "itemDraft" || this.run.flowMode === "weaponDraft") {
+      this.updateHud(time);
+      return;
+    }
+
+    if (this.run.flowMode === "statsPanel") {
+      if (Phaser.Input.Keyboard.JustDown(this.keys.tab) || Phaser.Input.Keyboard.JustDown(this.keys.escape)) {
+        this.closeStatsPanel();
+      }
+      this.updateHud(time);
+      return;
+    }
+
+    if (Phaser.Input.Keyboard.JustDown(this.keys.tab)) {
+      this.openStatsPanel();
       this.updateHud(time);
       return;
     }
@@ -532,7 +567,7 @@ export class GameScene extends Phaser.Scene {
     g.destroy();
   }
 
-  private generateUpgradeCategoryTexture(category: UpgradeCategory, tint: number): void {
+  private generateUpgradeCategoryTexture(category: ItemCategory, tint: number): void {
     const key = `upgrade-${category}`;
     const g = this.make.graphics({ x: 0, y: 0 });
     g.lineStyle(2, 0x12201d, 1);
@@ -643,6 +678,7 @@ export class GameScene extends Phaser.Scene {
     hpBg.lineStyle(2, 0x65746f, 0.45);
     hpBg.strokeRoundedRect(34, 26, 220, 12, 6);
     hpBg.strokeRoundedRect(34, 58, 220, 12, 6);
+    this.hudFrameElements.push(chrome, hpBg);
 
     this.hpBarFill = this.add.graphics().setDepth(42);
     this.xpBarFill = this.add.graphics().setDepth(42);
@@ -652,8 +688,38 @@ export class GameScene extends Phaser.Scene {
     this.phaseText = this.add.text(VIEW_WIDTH - 34, 12, "PHASE 1", titleStyle).setOrigin(1, 0).setDepth(42);
     this.timerText = this.add.text(VIEW_WIDTH - 34, 44, "00:40", labelStyle).setOrigin(1, 0).setDepth(42);
     this.enemyCountText = this.add.text(VIEW_WIDTH - 34, 68, "ENEMIES 0", smallStyle).setOrigin(1, 0).setDepth(42);
+    this.buildSummaryText = this.add
+      .text(VIEW_WIDTH / 2, VIEW_HEIGHT - 92, "BUILD  STARTER LOADOUT", {
+        fontFamily: "Trebuchet MS",
+        fontSize: "13px",
+        color: "#cdd8d1",
+        stroke: "#101513",
+        strokeThickness: 3,
+        align: "center"
+      })
+      .setOrigin(0.5)
+      .setDepth(42)
+      .setAlpha(0.82);
     this.weaponStripContainer = this.add.container(VIEW_WIDTH / 2, VIEW_HEIGHT - 52).setDepth(42);
     this.hintText = this.add.text(28, VIEW_HEIGHT - 22, "MOVE - WASD / ARROWS", smallStyle).setDepth(42).setOrigin(0, 1).setAlpha(0.82);
+    this.statsButtonPanel = this.add
+      .rectangle(116, VIEW_HEIGHT - 58, 156, 34, 0x141a18, 0.94)
+      .setStrokeStyle(2, 0x7aa0a3, 0.46)
+      .setDepth(42)
+      .setInteractive({ cursor: "pointer" });
+    this.statsButtonText = this.add
+      .text(116, VIEW_HEIGHT - 58, "TAB  BUILD STATS", {
+        fontFamily: "Trebuchet MS",
+        fontSize: "14px",
+        color: "#dce7e2",
+        stroke: "#141917",
+        strokeThickness: 3
+      })
+      .setOrigin(0.5)
+      .setDepth(43);
+    this.statsButtonPanel.on("pointerover", () => this.statsButtonPanel.setFillStyle(0x22302c, 1));
+    this.statsButtonPanel.on("pointerout", () => this.statsButtonPanel.setFillStyle(0x141a18, 0.94));
+    this.statsButtonPanel.on("pointerup", () => this.toggleStatsPanel());
     this.bannerText = this.add
       .text(VIEW_WIDTH / 2, VIEW_HEIGHT / 2 - 84, "", {
         fontFamily: "Trebuchet MS",
@@ -698,6 +764,8 @@ export class GameScene extends Phaser.Scene {
       d: Phaser.Input.Keyboard.KeyCodes.D,
       space: Phaser.Input.Keyboard.KeyCodes.SPACE,
       enter: Phaser.Input.Keyboard.KeyCodes.ENTER,
+      escape: Phaser.Input.Keyboard.KeyCodes.ESC,
+      tab: Phaser.Input.Keyboard.KeyCodes.TAB,
       one: Phaser.Input.Keyboard.KeyCodes.ONE,
       two: Phaser.Input.Keyboard.KeyCodes.TWO,
       three: Phaser.Input.Keyboard.KeyCodes.THREE
@@ -714,15 +782,19 @@ export class GameScene extends Phaser.Scene {
   private initializeState(): void {
     const profile = loadProfile(typeof window !== "undefined" ? window.localStorage : undefined);
     this.selectedCharacterId = profile.lastCharacterId;
-    this.run = this.createRunState(profile, this.selectedCharacterId, this.time.now, "characterSelect");
+    this.run = this.createRunState(profile, this.selectedCharacterId, this.time.now, "mainMenu");
     this.physics.pause();
     this.updateWeaponStrip();
-    this.openCharacterSelect();
+    this.openMainMenu();
   }
 
   private createRunState(profile: PersistentProfile, characterId: CharacterId, time: number, flowMode: RunState["flowMode"]): RunState {
+    const character = CHARACTERS[characterId];
     const activeSynergyIds: SynergyId[] = [];
-    const stats = buildPlayerStats({}, characterId, activeSynergyIds);
+    const selectedItems: RunState["selectedItems"] = [];
+    const equippedWeapons = [createEquippedWeapon(character.startingWeaponId, 0)];
+    const stats = buildPlayerStats(selectedItems, characterId, activeSynergyIds);
+    const shieldCharges = stats.maxShieldCharges;
     return {
       flowMode,
       phase: 1,
@@ -731,31 +803,40 @@ export class GameScene extends Phaser.Scene {
       hp: stats.maxHp,
       survivalStartedAt: time,
       selectedCharacter: characterId,
-      equippedWeapons: [createEquippedWeapon(STARTING_WEAPON, 0)],
+      equippedWeapons,
       pendingSpawns: [],
       persistentProfile: profile,
       bossPhasesTriggered: [],
       bannerUntil: 0,
       bannerText: "",
       stats,
+      buildSnapshot: buildDerivedRunStats({
+        hp: stats.maxHp,
+        stats,
+        selectedItems,
+        equippedWeapons,
+        shieldCharges
+      }),
       gameOver: false,
       level: 1,
       xp: 0,
       xpToNext: getXpToNextLevel(1),
-      activeUpgrades: {},
-      pendingLevelUps: 0,
+      selectedItems,
+      pendingItemChoices: 0,
       queuedRewards: [],
       notifications: [],
       xpOrbs: [],
       activeSynergyIds,
-      shieldCharges: stats.maxShieldCharges,
-      nextWeaponSlotId: 1,
+      shieldCharges,
+      nextWeaponSlotId: equippedWeapons.length,
       spawnAccumulator: 0,
       nextBurstAt: time + getBurstWaveInterval(),
       bossUnlockIndex: 0,
       lastBossId: null,
       phaseTransitionEndsAt: 0,
-      weaponDraftOffer: null
+      weaponDraftOffer: null,
+      currentItemOffer: null,
+      recentRarities: []
     };
   }
 
@@ -779,9 +860,16 @@ export class GameScene extends Phaser.Scene {
     this.playerSlowMultiplier = 1;
     this.livePauseStartedAt = null;
     this.phaseStartPending = false;
-    this.pushNotification(`${CHARACTERS[characterId].label} ready`, CHARACTERS[characterId].accent, this.time.now);
+    const character = CHARACTERS[characterId];
+    const startingWeapon = WEAPONS[character.startingWeaponId];
+    this.pushNotification(
+      `${character.label} deployed • ${startingWeapon.label} (${WEAPON_RARITIES[startingWeapon.rarity].label})`,
+      character.accent,
+      this.time.now
+    );
     this.showBanner("PHASE 1", 1_000, this.time.now);
     this.syncDroneCount(this.time.now);
+    this.refreshBuildSnapshot();
     this.updateWeaponStrip();
   }
 
@@ -798,10 +886,88 @@ export class GameScene extends Phaser.Scene {
     this.run.xpOrbs = [];
     this.run.spawnAccumulator = 0;
     this.run.nextBurstAt = this.time.now + getBurstWaveInterval();
+    this.run.currentItemOffer = null;
     this.destroyDrones();
     this.clearHazards();
     this.player.setVelocity(0, 0);
     this.lastWeaponStripSignature = "";
+  }
+
+  private refreshBuildSnapshot(): void {
+    this.run.buildSnapshot = buildDerivedRunStats({
+      hp: this.run.hp,
+      stats: this.run.stats,
+      selectedItems: this.run.selectedItems,
+      equippedWeapons: this.run.equippedWeapons,
+      shieldCharges: this.run.shieldCharges
+    });
+  }
+
+  private rebuildCombatStats(): void {
+    this.run.activeSynergyIds = getActiveSynergyIds(this.run.selectedItems);
+    this.run.stats = buildPlayerStats(this.run.selectedItems, this.selectedCharacterId, this.run.activeSynergyIds);
+    this.run.shieldCharges = Math.min(this.run.shieldCharges, this.run.stats.maxShieldCharges);
+    this.refreshBuildSnapshot();
+  }
+
+  private openMainMenu(): void {
+    this.menuScreen = "main";
+    this.run.flowMode = "mainMenu";
+    this.physics.pause();
+    this.player.setVisible(false);
+    this.player.setVelocity(0, 0);
+    this.clearOverlay();
+    this.createModalFrame("ROGUELITE WEB", "A sobrevivencia comeca aqui. Escolha um personagem, entre com uma arma inicial forte e empilhe caos legivel run apos run.");
+
+    const createMenuAction = (
+      label: string,
+      y: number,
+      accent: number,
+      onSelect: () => void,
+      disabled = false
+    ) => {
+      this.createActionButton(VIEW_WIDTH / 2, y, 336, 54, label, accent, onSelect, disabled);
+    };
+
+    createMenuAction("PLAY", 258, 0xcfe09a, () => this.openCharacterSelect());
+    createMenuAction("MULTIPLAYER LOCAL", 330, 0x6d7a76, () => undefined, true);
+    createMenuAction("MULTIPLAYER ONLINE", 402, 0x6d7a76, () => undefined, true);
+    createMenuAction(
+      "ABOUT",
+      492,
+      0x88b8d8,
+      () => this.openStaticMenuPanel("ABOUT", "Top-down survival roguelite focused on readable chaos, character identity, and modular progression.")
+    );
+    createMenuAction(
+      "SETTINGS",
+      564,
+      0xdab181,
+      () =>
+        this.openStaticMenuPanel(
+          "SETTINGS",
+          "Audio unlocks on first input. Use TAB during the run for build stats. Multiplayer modes stay visible here but remain disabled in this milestone."
+        )
+    );
+
+    const footer = this.add
+      .text(VIEW_WIDTH / 2, 642, "Only Play is active in this build. Choose a character to begin a single-player run.", {
+        fontFamily: "Trebuchet MS",
+        fontSize: "18px",
+        color: "#dce6de",
+        stroke: "#161b19",
+        strokeThickness: 3,
+        align: "center"
+      })
+      .setOrigin(0.5)
+      .setDepth(73);
+    this.overlayElements.push(footer);
+  }
+
+  private openStaticMenuPanel(title: string, body: string): void {
+    this.run.flowMode = "mainMenu";
+    this.clearOverlay();
+    this.createModalFrame(title, body);
+    this.createActionButton(VIEW_WIDTH / 2, 600, 280, 54, "BACK", 0x9db8af, () => this.openMainMenu());
   }
 
   private openCharacterSelect(): void {
@@ -811,49 +977,138 @@ export class GameScene extends Phaser.Scene {
     this.player.setVelocity(0, 0);
     this.clearOverlay();
     this.createModalFrame(
-      "CHARACTER SELECT",
-      "Pick an operator, then survive long enough to stack level-up cards and earn new weapons every five phases."
+      "Character Selection",
+      "Escolha a identidade da run. Cada personagem entra com passivas verdes e vermelhas, uma arma inicial fixa e um nivel de risco diferente."
     );
+    this.activeChoiceActions = [];
 
-    this.activeChoiceActions = CHARACTER_ORDER.map((characterId) => () => {
-      this.selectedCharacterId = characterId;
-      this.openCharacterSelect();
-    });
+    const selectedCharacter = CHARACTERS[this.selectedCharacterId];
+    const startingWeapon = WEAPONS[selectedCharacter.startingWeaponId];
+    const rarity = WEAPON_RARITIES[startingWeapon.rarity];
 
-    CHARACTER_ORDER.forEach((characterId, index) => {
-      const character = CHARACTERS[characterId];
-      const selected = characterId === this.selectedCharacterId;
-      const panel = this.createDraftCard({
-        x: VIEW_WIDTH / 2 + (index - 1) * 270,
-        y: 320,
-        width: 232,
-        height: 266,
-        title: character.label.toUpperCase(),
-        body: [character.summary, `Passive: ${character.passive}`, `Weakness: ${character.weakness}`].join("\n\n"),
-        accent: selected ? character.accent : 0x70807b,
-        hotkeyIndex: index,
-        onSelect: () => {
-          this.selectedCharacterId = characterId;
-          this.openCharacterSelect();
-        },
-        iconKey: "player",
-        selected
-      });
-      panel.setAlpha(selected ? 1 : 0.92);
-    });
+    this.createOverlayPanel(382, 292, 220, 188, 0x101513, 0x5c6965);
+    this.createOverlayPanel(852, 300, 438, 336, selectedCharacter.panelTint, selectedCharacter.accent);
 
-    const summary = this.add
+    const runOptionsTitle = this.add
+      .text(382, 214, "RUN OPTIONS", {
+        fontFamily: "Trebuchet MS",
+        fontSize: "24px",
+        color: "#f8f6eb",
+        stroke: "#161b19",
+        strokeThickness: 4
+      })
+      .setOrigin(0.5)
+      .setDepth(74);
+    const runOptionsBody = this.add
       .text(
-        VIEW_WIDTH / 2,
-        560,
-        [
-          `Starter weapon: ${WEAPONS[STARTING_WEAPON].label.toUpperCase()}`,
-          `Level-ups pause the run. Weapon drafts arrive every 5 phases. Bosses arrive every ${BOSS_PHASE_INTERVAL} phases.`,
-          `Saved profile key: ${PROFILE_STORAGE_KEY}`
-        ].join("\n"),
+        382,
+        292,
+        ["Mode  Single Player", "Arena  Crash Zone", `Bosses  Every ${BOSS_PHASE_INTERVAL} phases`, "Weapon Drafts  Phase 5+"].join("\n\n"),
         {
           fontFamily: "Trebuchet MS",
-          fontSize: "18px",
+          fontSize: "19px",
+          color: "#dce6de",
+          align: "left",
+          stroke: "#161b19",
+          strokeThickness: 3
+        }
+      )
+      .setOrigin(0.5)
+      .setDepth(74);
+
+    const portraitPlate = this.add.rectangle(690, 300, 152, 206, 0x131a18, 0.94).setStrokeStyle(2, selectedCharacter.accent, 0.92).setDepth(74);
+    const portrait = this.add.image(690, 300, "player").setTint(selectedCharacter.portraitTint ?? selectedCharacter.accent).setScale(2.35).setDepth(75);
+    const title = this.add
+      .text(852, 176, selectedCharacter.label.toUpperCase(), {
+        fontFamily: "Trebuchet MS",
+        fontSize: "32px",
+        color: "#f8f6eb",
+        stroke: "#161b19",
+        strokeThickness: 4
+      })
+      .setOrigin(0.5, 0)
+      .setDepth(75);
+    const difficulty = this.add
+      .text(852, 216, `Difficulty  ${selectedCharacter.difficultyLabel}`, {
+        fontFamily: "Trebuchet MS",
+        fontSize: "18px",
+        color: "#dce6de",
+        stroke: "#161b19",
+        strokeThickness: 3
+      })
+      .setOrigin(0.5, 0)
+      .setDepth(75);
+    const weaponBadge = this.add.rectangle(852, 258, 286, 36, rarity.fill, 0.96).setStrokeStyle(2, rarity.border, 0.96).setDepth(75);
+    const weaponText = this.add
+      .text(852, 258, `${startingWeapon.label}  •  ${rarity.label}`, {
+        fontFamily: "Trebuchet MS",
+        fontSize: "18px",
+        color: "#f8f6eb",
+        stroke: "#161b19",
+        strokeThickness: 3
+      })
+      .setOrigin(0.5)
+      .setDepth(76);
+    const summary = this.add
+      .text(852, 288, selectedCharacter.summary, {
+        fontFamily: "Trebuchet MS",
+        fontSize: "17px",
+        color: "#dce6de",
+        align: "center",
+        wordWrap: { width: 360 },
+        stroke: "#161b19",
+        strokeThickness: 3
+      })
+      .setOrigin(0.5, 0)
+      .setDepth(75);
+    const pros = this.add
+      .text(748, 356, ["POSITIVE", ...selectedCharacter.pros.map((entry) => `+ ${entry}`)].join("\n"), {
+        fontFamily: "Trebuchet MS",
+        fontSize: "18px",
+        color: "#8fe3a2",
+        align: "left",
+        wordWrap: { width: 176 },
+        stroke: "#161b19",
+        strokeThickness: 3
+      })
+      .setOrigin(0, 0)
+      .setDepth(75);
+    const cons = this.add
+      .text(924, 356, ["NEGATIVE", ...selectedCharacter.cons.map((entry) => `- ${entry}`)].join("\n"), {
+        fontFamily: "Trebuchet MS",
+        fontSize: "18px",
+        color: "#ff958b",
+        align: "left",
+        wordWrap: { width: 176 },
+        stroke: "#161b19",
+        strokeThickness: 3
+      })
+      .setOrigin(0, 0)
+      .setDepth(75);
+    this.overlayElements.push(runOptionsTitle, runOptionsBody, portraitPlate, portrait, title, difficulty, weaponBadge, weaponText, summary, pros, cons);
+
+    const columns = 4;
+    const spacingX = 102;
+    const spacingY = 76;
+    const startX = VIEW_WIDTH / 2 - ((columns - 1) * spacingX) / 2;
+    const startY = 518;
+    CHARACTER_ORDER.forEach((characterId, index) => {
+      const x = startX + (index % columns) * spacingX;
+      const y = startY + Math.floor(index / columns) * spacingY;
+      this.createCharacterIconButton(x, y, CHARACTERS[characterId], characterId === this.selectedCharacterId, () => {
+        this.selectedCharacterId = characterId;
+        this.openCharacterSelect();
+      });
+    });
+
+    const footer = this.add
+      .text(
+        VIEW_WIDTH / 2,
+        678,
+        [`Weapon drafts arrive every 5 phases. Bosses arrive every ${BOSS_PHASE_INTERVAL} phases.`, `The selected character is saved locally under ${PROFILE_STORAGE_KEY}.`].join("\n"),
+        {
+          fontFamily: "Trebuchet MS",
+          fontSize: "16px",
           color: "#dce6de",
           align: "center",
           stroke: "#161b19",
@@ -862,8 +1117,9 @@ export class GameScene extends Phaser.Scene {
       )
       .setOrigin(0.5)
       .setDepth(73);
-    this.overlayElements.push(summary);
-    this.createActionButton(VIEW_WIDTH / 2, 640, 250, 58, "START RUN", 0xc0d78f, () => this.startRun(this.selectedCharacterId));
+    this.overlayElements.push(footer);
+    this.createActionButton(VIEW_WIDTH / 2 - 170, 668, 220, 54, "BACK", 0x90a39c, () => this.openMainMenu());
+    this.createActionButton(VIEW_WIDTH / 2 + 170, 668, 260, 58, "START RUN", 0xc0d78f, () => this.startRun(this.selectedCharacterId));
   }
 
   private updatePlayerMovement(): void {
@@ -950,16 +1206,20 @@ export class GameScene extends Phaser.Scene {
       return;
     }
 
-    this.run.pendingLevelUps += levelsGained;
+    this.run.pendingItemChoices += levelsGained;
     this.pushNotification("Level up", 0xf3d277, time);
     this.showBanner("LEVEL UP", 650, time);
 
     if (this.run.flowMode === "live") {
-      this.openLevelUpDraft(time, true);
+      this.openItemDraft(time, true);
     }
   }
 
   private tryScheduleNormalSpawn(time: number, delta: number): void {
+    if (time < this.nextSpawnAttemptAt) {
+      return;
+    }
+
     const pendingNormals = this.run.pendingSpawns.filter((spawn) => spawn.enemyType !== "boss").length;
     const activeNormals = this.getActiveNormalEnemyCount();
     const cap = getPhaseEnemyCap(this.run.phase);
@@ -1034,20 +1294,28 @@ export class GameScene extends Phaser.Scene {
   }
 
   private scheduleBossSpawn(time: number): void {
-    const point = this.getSafeSpawnPoint() ?? this.getFallbackSpawnPoint();
     const bossId = getBossIdForPhase(this.run.phase, this.run.lastBossId);
     if (!bossId) {
       return;
     }
 
     const boss = BOSSES[bossId];
-    this.run.lastBossId = bossId;
     this.run.bossUnlockIndex = Math.max(
       this.run.bossUnlockIndex,
       BOSS_ORDER.findIndex((id) => id === bossId) + 1
     );
-    this.schedulePendingSpawn("boss", point.x, point.y, time, bossId);
+    const bossCount = getBossCountForBossPhase(this.run.phase);
+    for (let index = 0; index < bossCount; index += 1) {
+      const point = this.getSafeSpawnPoint() ?? this.getFallbackSpawnPoint();
+      const scheduledBossId =
+        index === 0 ? bossId : getBossIdForPhase(this.run.phase + index * 4, this.run.lastBossId ?? bossId, Phaser.Math.FloatBetween(0, 1)) ?? bossId;
+      this.run.lastBossId = scheduledBossId;
+      this.schedulePendingSpawn("boss", point.x, point.y, time, scheduledBossId);
+    }
     this.pushNotification(`Boss incoming: ${boss.label}`, boss.tint, time);
+    if (bossCount > 1) {
+      this.pushNotification("Double boss phase", 0xffb78a, time);
+    }
     this.showBanner("BOSS INCOMING", 1_100, time);
     this.audioController.boss();
   }
@@ -1863,7 +2131,10 @@ export class GameScene extends Phaser.Scene {
         y: drone.y + Math.sin(angle) * 16,
         angle,
         speed: 620,
-        damage: (this.run.activeSynergyIds.includes("droneOverclock") ? 1.7 : 1.25) * this.run.stats.damageMultiplier,
+        damage:
+          (this.run.activeSynergyIds.includes("droneOverclock") ? 1.7 : 1.25) *
+          this.run.stats.damageMultiplier *
+          this.run.stats.summonDamageMultiplier,
         tint: 0xc5f0ff,
         remainingPierce: 0,
         remainingBounce: 0,
@@ -1912,8 +2183,8 @@ export class GameScene extends Phaser.Scene {
     this.run.phase += 1;
     this.run.flowMode = "phaseTransition";
     this.run.phaseTransitionEndsAt = time + PHASE_COMPLETE_DURATION_MS;
-    this.run.queuedRewards = buildPhaseRewardQueue(this.run.phase, this.run.pendingLevelUps);
-    this.run.pendingLevelUps = 0;
+    this.run.queuedRewards = buildPhaseRewardQueue(this.run.phase, this.run.pendingItemChoices);
+    this.run.pendingItemChoices = 0;
     this.phaseStartPending = true;
     this.physics.pause();
     this.player.setVelocity(0, 0);
@@ -1927,8 +2198,10 @@ export class GameScene extends Phaser.Scene {
       this.run.flowMode = "live";
       this.run.phaseStartedAt = time;
       this.phaseStartPending = false;
+      this.nextSpawnAttemptAt = Math.max(this.nextSpawnAttemptAt, time + getPhaseRecoveryWindowMs(this.run.phase));
       this.physics.resume();
       this.showBanner(`PHASE ${this.run.phase}`, 850, time);
+      this.pushNotification("Brief recovery window", 0x8fbfd0, time);
       return;
     }
 
@@ -1937,11 +2210,11 @@ export class GameScene extends Phaser.Scene {
       return;
     }
 
-    if (nextReward.type === "levelUp") {
-      this.run.pendingLevelUps += 1;
-      this.openLevelUpDraft(time, false);
-      return;
-    }
+      if (nextReward.type === "itemDraft") {
+        this.run.pendingItemChoices += 1;
+        this.openItemDraft(time, false);
+        return;
+      }
 
     if (nextReward.type === "weaponDraft") {
       this.openWeaponDraft(nextReward.phase);
@@ -2033,12 +2306,21 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
-  private openLevelUpDraft(time: number, fromLive: boolean): void {
+  private openItemDraft(time: number, fromLive: boolean): void {
     if (fromLive) {
       this.beginLivePause(time);
     }
 
-    const choices = drawUpgradeChoices(UPGRADE_POOL, this.run.activeUpgrades, LEVEL_UP_CARD_COUNT);
+    const choices = drawItemChoices(
+      buildItemOfferContext({
+        phase: this.run.phase,
+        level: this.run.level,
+        characterId: this.selectedCharacterId,
+        items: this.run.selectedItems,
+        equippedWeapons: this.run.equippedWeapons,
+        stats: this.run.stats
+      })
+    ).slice(0, ITEM_CARD_COUNT);
     if (choices.length === 0) {
       if (this.livePauseStartedAt !== null) {
         this.resumeFromLivePause(time);
@@ -2048,37 +2330,54 @@ export class GameScene extends Phaser.Scene {
       return;
     }
 
-    this.run.flowMode = "levelUp";
+    this.run.currentItemOffer = choices;
+    this.run.flowMode = "itemDraft";
     this.clearOverlay();
-    this.createModalFrame("LEVEL UP", "Choose one upgrade. Combat stays paused until you lock in a card.");
-    this.activeChoiceActions = choices.map((choice) => () => this.selectUpgrade(choice));
+    this.createModalFrame("ITEM CHOICE", "Escolha 1 item. Os prós e contras já entram na build imediatamente.");
+    this.activeChoiceActions = choices.map((choice) => () => this.selectItemChoice(choice));
     choices.forEach((choice, index) => {
+      const definition = ITEM_BY_ID[choice.itemId];
+      const rarity = ITEM_RARITIES[choice.rarity];
+      const synergyLabels = definition.possibleSynergies.map((synergyId) => SYNERGY_BY_ID[synergyId].label).slice(0, 2);
       const card = this.createDraftCard({
         x: VIEW_WIDTH / 2 + (index - 1) * 250,
         y: VIEW_HEIGHT / 2 + 20,
-        width: 220,
-        height: 270,
-        title: choice.label.toUpperCase(),
-        body: choice.description,
-        accent: choice.accent,
+        width: 238,
+        height: 328,
+        title: `${definition.label.toUpperCase()} • ${rarity.label.toUpperCase()}`,
+        body: [
+          definition.description,
+          `Profile ${choice.profile.toUpperCase()}  •  ${definition.category.toUpperCase()}`,
+          `Tags ${definition.tags.slice(0, 4).join(", ")}`,
+          `+ ${definition.pros.join("\n+ ")}`,
+          `- ${definition.cons.join("\n- ")}`,
+          `Synergy hooks ${synergyLabels.length > 0 ? synergyLabels.join(", ") : "none"}`
+        ].join("\n\n"),
+        accent: rarity.accent,
         hotkeyIndex: index,
-        onSelect: () => this.selectUpgrade(choice),
-        iconKey: `upgrade-${choice.category}`
+        onSelect: () => this.selectItemChoice(choice),
+        iconKey: `upgrade-${definition.category}`,
+        fillColor: rarity.fill,
+        bodyColor: "#edf2ef"
       });
       this.animateCardIn(card, index);
     });
   }
 
-  private selectUpgrade(choice: UpgradeDef): void {
+  private selectItemChoice(choice: ItemOfferChoice): void {
     const oldStats = this.run.stats;
     const oldSynergies = new Set(this.run.activeSynergyIds);
-    this.run.activeUpgrades[choice.id] = (this.run.activeUpgrades[choice.id] ?? 0) + 1;
-    this.run.pendingLevelUps = Math.max(0, this.run.pendingLevelUps - 1);
-    this.run.activeSynergyIds = getActiveSynergyIds(this.run.activeUpgrades);
-    this.run.stats = buildPlayerStats(this.run.activeUpgrades, this.selectedCharacterId, this.run.activeSynergyIds);
+    const definition = ITEM_BY_ID[choice.itemId];
+    this.run.selectedItems = [...this.run.selectedItems, createItemInstance(choice.itemId, choice.rarity, this.run.level, this.run.phase)];
+    this.run.pendingItemChoices = Math.max(0, this.run.pendingItemChoices - 1);
+    this.run.recentRarities = [...this.run.recentRarities, choice.rarity].slice(-6);
+    this.run.activeSynergyIds = getActiveSynergyIds(this.run.selectedItems);
+    this.run.stats = buildPlayerStats(this.run.selectedItems, this.selectedCharacterId, this.run.activeSynergyIds);
     const maxHpIncrease = this.run.stats.maxHp - oldStats.maxHp;
     if (maxHpIncrease > 0) {
       this.run.hp = Math.min(this.run.stats.maxHp, this.run.hp + maxHpIncrease);
+    } else {
+      this.run.hp = Math.min(this.run.hp, this.run.stats.maxHp);
     }
     if (this.run.stats.maxShieldCharges > oldStats.maxShieldCharges) {
       this.run.shieldCharges = this.run.stats.maxShieldCharges;
@@ -2086,17 +2385,19 @@ export class GameScene extends Phaser.Scene {
       this.run.shieldCharges = Math.min(this.run.shieldCharges, this.run.stats.maxShieldCharges);
     }
     this.syncDroneCount(this.time.now);
-    this.pushNotification(choice.label, choice.accent, this.time.now);
+    this.refreshBuildSnapshot();
+    this.pushNotification(`${definition.label} • ${ITEM_RARITIES[choice.rarity].label}`, ITEM_RARITIES[choice.rarity].accent, this.time.now);
     this.run.activeSynergyIds
       .filter((synergyId) => !oldSynergies.has(synergyId))
       .forEach((synergyId) => {
         const synergy = SYNERGY_BY_ID[synergyId];
         this.pushNotification(`Synergy: ${synergy.label}`, synergy.accent, this.time.now);
       });
+    this.run.currentItemOffer = null;
     this.clearOverlay();
 
-    if (this.run.pendingLevelUps > 0) {
-      this.openLevelUpDraft(this.time.now, false);
+    if (this.run.pendingItemChoices > 0) {
+      this.openItemDraft(this.time.now, false);
       return;
     }
 
@@ -2121,17 +2422,21 @@ export class GameScene extends Phaser.Scene {
     this.activeChoiceActions = choices.map((weaponId) => () => this.selectWeapon(weaponId));
     choices.forEach((weaponId, index) => {
       const weapon = WEAPONS[weaponId];
+      const rarity = WEAPON_RARITIES[weapon.rarity];
       const card = this.createDraftCard({
         x: VIEW_WIDTH / 2 + (index - 1) * 250,
         y: VIEW_HEIGHT / 2 + 20,
         width: 220,
         height: 296,
-        title: weapon.label.toUpperCase(),
-        body: weapon.description,
-        accent: weapon.tint,
+        title: `${weapon.label.toUpperCase()} • ${rarity.label.toUpperCase()}`,
+        body: [weapon.description, `Family ${weapon.family.toUpperCase()}  -  Tier ${weapon.tier}`, `Behavior ${weapon.behaviorKind}`].join(
+          "\n\n"
+        ),
+        accent: rarity.accent,
         hotkeyIndex: index,
         onSelect: () => this.selectWeapon(weaponId),
-        iconKey: weapon.iconKey
+        iconKey: weapon.iconKey,
+        fillColor: rarity.fill
       });
       this.createWeaponPreview(card, weapon);
       this.animateCardIn(card, index);
@@ -2142,6 +2447,7 @@ export class GameScene extends Phaser.Scene {
     this.run.equippedWeapons = appendEquippedWeapon(this.run.equippedWeapons, weaponId, this.run.nextWeaponSlotId);
     this.run.nextWeaponSlotId += 1;
     this.run.weaponDraftOffer = null;
+    this.refreshBuildSnapshot();
     this.pushNotification(`New weapon: ${WEAPONS[weaponId].label}`, WEAPONS[weaponId].tint, this.time.now);
     this.clearOverlay();
     this.updateWeaponStrip();
@@ -2152,6 +2458,138 @@ export class GameScene extends Phaser.Scene {
     }
 
     this.resolveQueuedRewards(this.time.now);
+  }
+
+  private openStatsPanel(): void {
+    if (this.run.flowMode !== "live") {
+      return;
+    }
+
+    this.beginLivePause(this.time.now);
+    this.run.flowMode = "statsPanel";
+    this.refreshBuildSnapshot();
+    this.clearOverlay();
+    this.createModalFrame("BUILD STATS", "Leitura em tempo real da run atual. Feche com TAB, ESC ou pelo botão abaixo.");
+
+    const snapshot = this.run.buildSnapshot;
+    const projectileCountLabel =
+      snapshot.projectileCountMin === snapshot.projectileCountMax
+        ? `${snapshot.projectileCountMin}`
+        : `${snapshot.projectileCountMin} - ${snapshot.projectileCountMax}`;
+    const offense = [
+      `Damage x${snapshot.damageMultiplier.toFixed(2)}`,
+      `Attack speed x${snapshot.attackSpeedMultiplier.toFixed(2)}`,
+      `Crit chance ${(snapshot.critChance * 100).toFixed(0)}%`,
+      `Crit multiplier x${snapshot.critDamageMultiplier.toFixed(2)}`,
+      `Projectile count ${projectileCountLabel}`,
+      `Bonus projectiles +${snapshot.projectileBonus}`,
+      `Projectile speed x${snapshot.projectileSpeedMultiplier.toFixed(2)}`,
+      `Projectile size x${snapshot.projectileSizeMultiplier.toFixed(2)}`,
+      `Spread x${snapshot.spreadMultiplier.toFixed(2)}`,
+      `Pierce ${snapshot.pierce}`,
+      `Bounce ${snapshot.bounce}`
+    ].join("\n");
+    const defense = [
+      `HP ${Math.ceil(snapshot.currentHp)} / ${snapshot.maxHp}`,
+      `Move speed ${snapshot.moveSpeed.toFixed(0)}`,
+      `Armor ${snapshot.armor.toFixed(1)}`,
+      `Dodge ${(snapshot.dodgeChance * 100).toFixed(0)}%`,
+      `Lifesteal ${(snapshot.lifesteal * 100).toFixed(0)}%`,
+      `Regen ${snapshot.regenPerSecond.toFixed(2)}/s`,
+      `Shield ${snapshot.shieldCharges} / ${snapshot.maxShieldCharges}`,
+      `Items ${snapshot.itemCount}`
+    ].join("\n");
+    const utility = [
+      `Knockback x${snapshot.knockbackMultiplier.toFixed(2)}`,
+      `XP magnet ${Math.round(snapshot.xpMagnetRadius)}`,
+      `Summon damage x${snapshot.summonDamageMultiplier.toFixed(2)}`,
+      `Item luck ${(snapshot.itemLuck * 100).toFixed(0)}%`,
+      `Dominant tags: ${snapshot.dominantTags.map((entry) => `${entry.tag}(${entry.count})`).join(", ") || "None"}`
+    ].join("\n");
+    const build = [
+      `Weapons: ${snapshot.equippedWeapons.join(", ") || "None"}`,
+      `Synergies: ${this.run.activeSynergyIds.map((id) => SYNERGY_BY_ID[id].label).join(", ") || "None"}`
+    ].join("\n\n");
+
+    const offenseLabel = this.add
+      .text(VIEW_WIDTH / 2 - 320, 214, "OFFENSE", {
+        fontFamily: "Trebuchet MS",
+        fontSize: "18px",
+        color: "#f3d38b",
+        stroke: "#161b19",
+        strokeThickness: 3
+      })
+      .setDepth(75);
+    const defenseLabel = this.add
+      .text(VIEW_WIDTH / 2 - 20, 214, "DEFENSE", {
+        fontFamily: "Trebuchet MS",
+        fontSize: "18px",
+        color: "#98d6ad",
+        stroke: "#161b19",
+        strokeThickness: 3
+      })
+      .setDepth(75);
+    const utilityLabel = this.add
+      .text(VIEW_WIDTH / 2 + 210, 214, "UTILITY + BUILD", {
+        fontFamily: "Trebuchet MS",
+        fontSize: "18px",
+        color: "#9dc4ff",
+        stroke: "#161b19",
+        strokeThickness: 3
+      })
+      .setDepth(75);
+
+    const left = this.add
+      .text(VIEW_WIDTH / 2 - 320, 250, offense, {
+        fontFamily: "Trebuchet MS",
+        fontSize: "18px",
+        color: "#f4f6ee",
+        stroke: "#161b19",
+        strokeThickness: 3,
+        wordWrap: { width: 250 }
+      })
+      .setDepth(75);
+    const middle = this.add
+      .text(VIEW_WIDTH / 2 - 20, 250, defense, {
+        fontFamily: "Trebuchet MS",
+        fontSize: "18px",
+        color: "#dce7dd",
+        stroke: "#161b19",
+        strokeThickness: 3,
+        wordWrap: { width: 220 }
+      })
+      .setDepth(75);
+    const right = this.add
+      .text(VIEW_WIDTH / 2 + 210, 250, `${utility}\n\n${build}`, {
+        fontFamily: "Trebuchet MS",
+        fontSize: "17px",
+        color: "#dae4ff",
+        stroke: "#161b19",
+        strokeThickness: 3,
+        wordWrap: { width: 260 }
+      })
+      .setDepth(75);
+    this.overlayElements.push(offenseLabel, defenseLabel, utilityLabel, left, middle, right);
+    this.createActionButton(VIEW_WIDTH / 2, 640, 240, 52, "CLOSE", 0x8fb2b8, () => this.closeStatsPanel());
+  }
+
+  private closeStatsPanel(): void {
+    if (this.run.flowMode !== "statsPanel") {
+      return;
+    }
+
+    this.resumeFromLivePause(this.time.now);
+  }
+
+  private toggleStatsPanel(): void {
+    if (this.run.flowMode === "live") {
+      this.openStatsPanel();
+      return;
+    }
+
+    if (this.run.flowMode === "statsPanel") {
+      this.closeStatsPanel();
+    }
   }
 
   private handlePlayerBulletHit(bullet: BulletSprite, enemy: EnemySprite): void {
@@ -2372,6 +2810,7 @@ export class GameScene extends Phaser.Scene {
 
     const previous = this.run.hp;
     this.run.hp = Math.min(this.run.stats.maxHp, this.run.hp + amount);
+    this.refreshBuildSnapshot();
     if (this.run.hp > previous + 0.1) {
       this.spawnFloatingText(this.player.x, this.player.y - 34, `+${this.run.hp - previous > 1 ? Math.round(this.run.hp - previous) : 1}`, "#9ff0bd");
     }
@@ -2383,8 +2822,17 @@ export class GameScene extends Phaser.Scene {
       return;
     }
 
+    if (this.run.stats.dodgeChance > 0 && Math.random() < this.run.stats.dodgeChance) {
+      this.playerInvulnerableUntil = now + Math.round(PLAYER_IFRAME_MS * 0.5);
+      this.spawnFloatingText(this.player.x, this.player.y - 28, "DODGE", "#9ff6df");
+      this.spawnParticleBurst(this.player.x, this.player.y, 5, 0x99f2da);
+      this.pushNotification("Dodge", 0x99f2da, now);
+      return;
+    }
+
     if (this.run.shieldCharges > 0) {
       this.run.shieldCharges -= 1;
+      this.refreshBuildSnapshot();
       this.playerInvulnerableUntil = now + PLAYER_IFRAME_MS;
       this.playerFlashUntil = now + 180;
       this.spawnParticleBurst(this.player.x, this.player.y, 8, 0xa6d9ff);
@@ -2394,6 +2842,7 @@ export class GameScene extends Phaser.Scene {
 
     const adjusted = Math.max(1, amount - this.run.stats.armor);
     this.run.hp = Math.max(0, this.run.hp - adjusted);
+    this.refreshBuildSnapshot();
     this.playerInvulnerableUntil = now + PLAYER_IFRAME_MS;
     this.playerFlashUntil = now + 220;
     this.audioController.hurt();
@@ -2554,7 +3003,11 @@ export class GameScene extends Phaser.Scene {
       .text(
         VIEW_WIDTH / 2,
         VIEW_HEIGHT / 2 + 18,
-        "The run ends here. Restart to re-enter the arena with your last selected character and rebuild your power from scratch.",
+        [
+          "The run ends here. Restart to re-enter the arena with your last selected character and rebuild your power from scratch.",
+          `Items collected ${this.run.selectedItems.length}  -  Active synergies ${this.run.activeSynergyIds.length}`,
+          `Build focus ${this.run.buildSnapshot.dominantTags.map((entry) => entry.tag).slice(0, 3).join(", ") || "starter loadout"}`
+        ].join("\n\n"),
         {
           fontFamily: "Trebuchet MS",
           fontSize: "18px",
@@ -2766,22 +3219,55 @@ export class GameScene extends Phaser.Scene {
     this.phaseText.setText(`PHASE ${this.run.phase}`);
     this.timerText.setText(this.formatSeconds(timerValue));
     this.enemyCountText.setText(`ENEMIES ${this.getActiveEnemyCount()}`);
+    this.buildSummaryText.setText(
+      this.run.buildSnapshot.dominantTags.length > 0
+        ? `BUILD  ${this.run.selectedItems.length} ITEMS  •  ${this.run.buildSnapshot.dominantTags
+            .slice(0, 3)
+            .map((entry) => `${String(entry.tag).toUpperCase()} ${entry.count}`)
+            .join("  •  ")}`
+        : `BUILD  STARTER LOADOUT  •  ${this.run.equippedWeapons.length} WEAPON SLOTS`
+    );
+    const showRuntimeHud = this.run.flowMode !== "mainMenu" && this.run.flowMode !== "characterSelect" && this.run.flowMode !== "gameOver";
+    this.hudFrameElements.forEach((element) => {
+      if ("setVisible" in element && typeof element.setVisible === "function") {
+        element.setVisible(showRuntimeHud);
+      }
+    });
+    this.hpBarFill.setVisible(showRuntimeHud);
+    this.xpBarFill.setVisible(showRuntimeHud);
+    this.hpLabelText.setVisible(showRuntimeHud);
+    this.xpLabelText.setVisible(showRuntimeHud);
+    this.levelText.setVisible(showRuntimeHud);
+    this.phaseText.setVisible(showRuntimeHud);
+    this.timerText.setVisible(showRuntimeHud);
+    this.enemyCountText.setVisible(showRuntimeHud);
+    this.weaponStripContainer.setVisible(showRuntimeHud);
 
-    if (this.run.flowMode === "characterSelect") {
+    if (this.run.flowMode === "mainMenu") {
+      this.hintText.setText("CLICK PLAY TO BEGIN");
+    } else if (this.run.flowMode === "characterSelect") {
       this.hintText.setText("PRESS SPACE / ENTER TO START");
     } else if (this.run.flowMode === "gameOver") {
       this.hintText.setText("PRESS SPACE / ENTER TO RESTART");
-    } else if (this.run.flowMode === "levelUp" || this.run.flowMode === "weaponDraft") {
+    } else if (this.run.flowMode === "itemDraft" || this.run.flowMode === "weaponDraft") {
       this.hintText.setText("PRESS 1 / 2 / 3 OR CLICK A CARD");
+    } else if (this.run.flowMode === "statsPanel") {
+      this.hintText.setText("TAB / ESC TO CLOSE BUILD STATS");
     } else {
       this.hintText.setText(`MOVE - WASD / ARROWS  •  SHIELDS ${this.run.shieldCharges}`);
     }
 
+    const statsButtonVisible = this.run.flowMode === "live" || this.run.flowMode === "statsPanel";
+    this.statsButtonPanel.setVisible(statsButtonVisible);
+    this.statsButtonText.setVisible(statsButtonVisible);
+    this.buildSummaryText.setVisible(
+      this.run.flowMode === "live" || this.run.flowMode === "statsPanel" || this.run.flowMode === "phaseTransition"
+    );
     this.updateWeaponStrip();
   }
 
   private updateWeaponStrip(): void {
-    const signature = this.run.equippedWeapons.map((weapon) => weapon.weaponId).join("|");
+    const signature = this.run.equippedWeapons.map((weapon) => `${weapon.weaponId}:${weapon.rarity}`).join("|");
     if (signature === this.lastWeaponStripSignature) {
       return;
     }
@@ -2795,7 +3281,10 @@ export class GameScene extends Phaser.Scene {
 
     visibleWeapons.forEach((equippedWeapon, index) => {
       const weapon = WEAPONS[equippedWeapon.weaponId];
-      const background = this.add.rectangle(startX + index * spacing, 0, size + 10, size + 10, 0x141b19, 0.95).setStrokeStyle(2, weapon.tint, 0.65);
+      const rarity = WEAPON_RARITIES[equippedWeapon.rarity];
+      const background = this.add
+        .rectangle(startX + index * spacing, 0, size + 10, size + 10, rarity.fill, 0.95)
+        .setStrokeStyle(2, rarity.border, 0.85);
       const icon = this.add.image(startX + index * spacing, 0, weapon.iconKey).setScale(size / 40);
       this.weaponStripContainer.add([background, icon]);
     });
@@ -2900,11 +3389,16 @@ export class GameScene extends Phaser.Scene {
     onSelect: () => void;
     iconKey?: string;
     selected?: boolean;
+    fillColor?: number;
+    bodyColor?: string;
+    footerLabel?: string;
+    bodyFontSize?: string;
   }): Phaser.GameObjects.Container {
     const panel = this.add.container(options.x, options.y).setDepth(75);
     const hasIcon = Boolean(options.iconKey);
+    const baseFill = options.fillColor ?? (options.selected ? 0x22302c : 0x16201d);
     const card = this.add
-      .rectangle(0, 0, options.width, options.height, options.selected ? 0x22302c : 0x16201d, 0.98)
+      .rectangle(0, 0, options.width, options.height, baseFill, 0.98)
       .setStrokeStyle(2, options.accent, 0.9);
     const accentBar = this.add.rectangle(0, -options.height / 2 + 9, options.width - 24, 9, options.accent, 1);
     panel.add([card, accentBar]);
@@ -2926,14 +3420,14 @@ export class GameScene extends Phaser.Scene {
     const bodyText = this.add
       .text(0, hasIcon ? 20 : -2, options.body, {
         fontFamily: "Trebuchet MS",
-        fontSize: "15px",
-        color: "#dbe5dc",
+        fontSize: options.bodyFontSize ?? "15px",
+        color: options.bodyColor ?? "#dbe5dc",
         align: "center",
         wordWrap: { width: options.width - 30 }
       })
       .setOrigin(0.5, 0.5);
     const footerText = this.add
-      .text(0, options.height / 2 - 22, `PRESS ${options.hotkeyIndex + 1} OR CLICK`, {
+      .text(0, options.height / 2 - 22, options.footerLabel ?? `PRESS ${options.hotkeyIndex + 1} OR CLICK`, {
         fontFamily: "Trebuchet MS",
         fontSize: "12px",
         color: "#c9d3cb"
@@ -2950,7 +3444,7 @@ export class GameScene extends Phaser.Scene {
       panel.y = options.y - 6;
     });
     panel.on("pointerout", () => {
-      card.setFillStyle(options.selected ? 0x22302c : 0x16201d, 0.98);
+      card.setFillStyle(baseFill, 0.98);
       panel.y = options.y;
     });
     panel.on("pointerup", () => options.onSelect());
@@ -3018,28 +3512,86 @@ export class GameScene extends Phaser.Scene {
     });
   }
 
-  private createActionButton(x: number, y: number, width: number, height: number, label: string, accent: number, onSelect: () => void): void {
+  private createOverlayPanel(x: number, y: number, width: number, height: number, fill: number, stroke: number): Phaser.GameObjects.Rectangle {
+    const panel = this.add
+      .rectangle(x, y, width, height, fill, 0.96)
+      .setStrokeStyle(2, stroke, 0.92)
+      .setDepth(73);
+    this.overlayElements.push(panel);
+    return panel;
+  }
+
+  private createCharacterIconButton(
+    x: number,
+    y: number,
+    character: (typeof CHARACTERS)[CharacterId],
+    selected: boolean,
+    onSelect: () => void
+  ): void {
     const panel = this.add.container(x, y).setDepth(75);
-    const button = this.add.rectangle(0, 0, width, height, 0x16201d, 0.98).setStrokeStyle(2, accent, 0.95);
+    const background = this.add
+      .rectangle(0, 0, 60, 60, selected ? character.panelTint : 0x121816, 0.98)
+      .setStrokeStyle(2, selected ? character.accent : 0x677570, 0.94);
+    const icon = this.add.image(0, -4, "player").setTint(character.portraitTint ?? character.accent).setScale(1.1);
+    const label = this.add
+      .text(0, 24, character.label.slice(0, 3).toUpperCase(), {
+        fontFamily: "Trebuchet MS",
+        fontSize: "11px",
+        color: selected ? "#f8f6eb" : "#dbe5dc",
+        stroke: "#161b19",
+        strokeThickness: 2
+      })
+      .setOrigin(0.5);
+    panel.add([background, icon, label]);
+    panel.setSize(60, 60);
+    panel.setInteractive(new Phaser.Geom.Rectangle(-30, -30, 60, 60), Phaser.Geom.Rectangle.Contains);
+    panel.on("pointerover", () => {
+      background.setFillStyle(selected ? character.panelTint : 0x22302c, 1);
+      panel.setScale(1.04);
+    });
+    panel.on("pointerout", () => {
+      background.setFillStyle(selected ? character.panelTint : 0x121816, 0.98);
+      panel.setScale(1);
+    });
+    panel.on("pointerup", () => onSelect());
+    this.overlayElements.push(panel);
+  }
+
+  private createActionButton(
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+    label: string,
+    accent: number,
+    onSelect: () => void,
+    disabled = false
+  ): void {
+    const panel = this.add.container(x, y).setDepth(75);
+    const button = this.add
+      .rectangle(0, 0, width, height, disabled ? 0x101614 : 0x16201d, disabled ? 0.9 : 0.98)
+      .setStrokeStyle(2, accent, disabled ? 0.42 : 0.95);
     const text = this.add
       .text(0, 0, label, {
         fontFamily: "Trebuchet MS",
         fontSize: "22px",
-        color: "#f8f6eb"
+        color: disabled ? "#87948f" : "#f8f6eb"
       })
       .setOrigin(0.5);
     panel.add([button, text]);
     panel.setSize(width, height);
-    panel.setInteractive(new Phaser.Geom.Rectangle(-width / 2, -height / 2, width, height), Phaser.Geom.Rectangle.Contains);
-    panel.on("pointerover", () => {
-      button.setFillStyle(0x22302c, 1);
-      panel.setScale(1.02);
-    });
-    panel.on("pointerout", () => {
-      button.setFillStyle(0x16201d, 0.98);
-      panel.setScale(1);
-    });
-    panel.on("pointerup", () => onSelect());
+    if (!disabled) {
+      panel.setInteractive(new Phaser.Geom.Rectangle(-width / 2, -height / 2, width, height), Phaser.Geom.Rectangle.Contains);
+      panel.on("pointerover", () => {
+        button.setFillStyle(0x22302c, 1);
+        panel.setScale(1.02);
+      });
+      panel.on("pointerout", () => {
+        button.setFillStyle(0x16201d, 0.98);
+        panel.setScale(1);
+      });
+      panel.on("pointerup", () => onSelect());
+    }
     this.overlayElements.push(panel);
   }
 

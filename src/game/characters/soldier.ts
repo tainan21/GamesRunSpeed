@@ -1,13 +1,15 @@
-import type { CharacterDef } from "../types";
+import { defineCharacter, proAdd, proMul, conMul } from "./shared";
 
-export const soldier: CharacterDef = {
+export const soldier = defineCharacter({
   id: "soldier",
   label: "Soldier",
-  summary: "Balanced gunner with disciplined output.",
-  passive: "+20% attack speed",
-  weakness: "-10% movement speed",
+  summary: "Frontliner disciplinado com cadencia forte e base segura.",
+  difficultyLabel: "Easy",
+  startingWeaponId: "assaultRifle",
+  pros: ["+15% attack speed", "+10 max HP"],
+  cons: ["-5% movement speed"],
+  passiveEffects: [proMul("attackSpeedMultiplier", 1.15), proAdd("maxHp", 10), conMul("moveSpeed", 0.95)],
   accent: 0xe9d28a,
   panelTint: 0x4d5f5b,
-  attackSpeedMultiplier: 1.2,
-  moveSpeedMultiplier: 0.9
-};
+  portraitTint: 0xe7ddb7
+});

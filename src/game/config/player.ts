@@ -31,5 +31,8 @@ export const BASE_PLAYER_STATS: PlayerStats = {
   chainLightningChance: 0,
   chainLightningTargets: 0,
   chainLightningDamageMultiplier: 0,
-  droneCount: 0
+  droneCount: 0,
+  dodgeChance: 0,
+  summonDamageMultiplier: 1,
+  itemLuck: 0
 };

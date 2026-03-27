@@ -1,23 +1,28 @@
 import { describe, expect, it } from "vitest";
 import { BOSSES } from "./config/boss";
+import { ITEM_BY_ID } from "./config/items";
 import { WEAPONS } from "./config/weapons";
 import {
   appendEquippedWeapon,
-  applyCharacterToStats,
   awardXpProgress,
+  buildItemOfferContext,
   buildPhaseRewardQueue,
   buildPlayerStats,
   chooseEnemyType,
   createEquippedWeapon,
-  drawUpgradeChoices,
+  createItemInstance,
+  drawItemChoices,
   drawWeaponChoices,
   getActiveSynergyIds,
+  getBossCountForBossPhase,
   getBossHealthMultiplier,
   getBossIdForPhase,
   getBurstWaveCount,
   getEnemyHealthMultiplier,
   getEnemySpeedMultiplier,
+  getPhaseRecoveryWindowMs,
   getPhaseEnemyCap,
+  getRarityWeightsForPhase,
   getReadyWeapons,
   getSpawnRatePerSecond,
   getUnlockedWeaponPool,
@@ -27,9 +32,10 @@ import {
   stepSpawnAccumulator
 } from "./logic";
 import { loadProfile, saveProfile } from "./profile";
+import { applyCharacterToStats, buildDerivedRunStats } from "./stats";
 
-describe("roguelite v5 logic helpers", () => {
-  it("applies character modifiers and synergy-aware run stats", () => {
+describe("roguelite roadmap logic", () => {
+  it("applies character modifiers and item-based synergies", () => {
     const soldierStats = applyCharacterToStats(
       {
         maxHp: 100,
@@ -65,8 +71,10 @@ describe("roguelite v5 logic helpers", () => {
         id: "soldier",
         label: "Soldier",
         summary: "",
-        passive: "",
-        weakness: "",
+        difficultyLabel: "Easy",
+        starterWeapons: ["pistol", "burstRifle"],
+        pros: [],
+        cons: [],
         accent: 0,
         panelTint: 0,
         moveSpeedMultiplier: 0.9,
@@ -77,22 +85,20 @@ describe("roguelite v5 logic helpers", () => {
     expect(soldierStats.moveSpeed).toBeCloseTo(207);
     expect(soldierStats.attackSpeedMultiplier).toBeCloseTo(1.2);
 
-    const synergyStats = buildPlayerStats(
-      {
-        arcNetwork: 1,
-        steadyAim: 1,
-        vampiricRounds: 1,
-        rapidCycle: 1
-      },
-      "soldier"
-    );
+    const selectedItems = [
+      createItemInstance("arcNetwork", "epic", 3, 2),
+      createItemInstance("steadyAim", "common", 3, 2),
+      createItemInstance("vampiricRounds", "rare", 3, 2),
+      createItemInstance("rapidCycle", "common", 3, 2)
+    ];
+    const synergyStats = buildPlayerStats(selectedItems, "soldier", getActiveSynergyIds(selectedItems));
 
     expect(synergyStats.chainLightningTargets).toBeGreaterThan(2);
     expect(synergyStats.lifeSteal).toBeGreaterThan(0.03);
     expect(synergyStats.attackSpeedMultiplier).toBeGreaterThan(1.2);
   });
 
-  it("uses the v5 density cap curve and reward cadence", () => {
+  it("uses the density cap curve and item reward cadence", () => {
     expect(getPhaseEnemyCap(1)).toBe(10);
     expect(getPhaseEnemyCap(5)).toBe(25);
     expect(getPhaseEnemyCap(10)).toBe(40);
@@ -100,19 +106,19 @@ describe("roguelite v5 logic helpers", () => {
     expect(getPhaseEnemyCap(21)).toBe(86);
 
     expect(buildPhaseRewardQueue(5, 2)).toEqual([
-      { type: "levelUp", phase: 5 },
-      { type: "levelUp", phase: 5 },
+      { type: "itemDraft", phase: 5 },
+      { type: "itemDraft", phase: 5 },
       { type: "weaponDraft", phase: 5 }
     ]);
 
     expect(buildPhaseRewardQueue(20, 1)).toEqual([
-      { type: "levelUp", phase: 20 },
+      { type: "itemDraft", phase: 20 },
       { type: "weaponDraft", phase: 20 },
       { type: "bossSpawn", phase: 20 }
     ]);
   });
 
-  it("unlocks the 40-weapon pool by tier and drafts fresh-first", () => {
+  it("unlocks the weapon pool by tier and drafts fresh-first", () => {
     const phase5Pool = getUnlockedWeaponPool(5);
     const phase10Pool = getUnlockedWeaponPool(10);
     const phase20Pool = getUnlockedWeaponPool(20);
@@ -126,12 +132,9 @@ describe("roguelite v5 logic helpers", () => {
     expect(choices.every((weaponId) => WEAPONS[weaponId].tier === 1)).toBe(true);
     expect(choices.includes("pistol")).toBe(false);
     expect(choices.includes("machineGun")).toBe(false);
-
-    const exhaustedChoices = drawWeaponChoices(5, phase5Pool.slice(0, phase5Pool.length - 1), 3, [0, 0.2, 0.6]);
-    expect(exhaustedChoices[0]).toBe(phase5Pool[phase5Pool.length - 1]);
   });
 
-  it("schedules fixed bosses through phase 40 and avoids immediate repeats after that", () => {
+  it("schedules fixed bosses, avoids immediate repeats, and enables double-boss milestones", () => {
     expect(getBossIdForPhase(4, null)).toBe("titan");
     expect(getBossIdForPhase(24, "ironColossus")).toBe("voidPhantom");
     expect(getBossIdForPhase(40, "orbitalTyrant")).toBe("finalWarden");
@@ -139,9 +142,13 @@ describe("roguelite v5 logic helpers", () => {
     const post40 = getBossIdForPhase(44, "finalWarden", 0);
     expect(post40).not.toBe("finalWarden");
     expect(post40 && BOSSES[post40].introductionPhase <= 44).toBe(true);
+    expect(getBossCountForBossPhase(8)).toBe(1);
+    expect(getBossCountForBossPhase(12)).toBe(2);
+    expect(getBossCountForBossPhase(16)).toBe(2);
+    expect(getBossCountForBossPhase(20)).toBe(2);
   });
 
-  it("matches the v5 spawn, burst, and difficulty formulas", () => {
+  it("matches spawn, burst, and difficulty formulas", () => {
     expect(getSpawnRatePerSecond(1)).toBeCloseTo(1.55);
     expect(getSpawnRatePerSecond(25)).toBeCloseTo((1.2 + 25 * 0.35) * 2);
 
@@ -163,31 +170,32 @@ describe("roguelite v5 logic helpers", () => {
     expect(chooseEnemyType(25, 0.5)).toBe("elite");
   });
 
-  it("tracks xp overflow and queued levels correctly", () => {
-    expect(getXpToNextLevel(1)).toBe(6);
-    expect(getXpToNextLevel(4)).toBe(18);
+  it("tracks xp overflow with the new retention curve", () => {
+    expect(getXpToNextLevel(1)).toBe(5);
+    expect(getXpToNextLevel(4)).toBe(14);
+    expect(getXpToNextLevel(11)).toBe(43);
 
-    const awarded = awardXpProgress({ level: 1, xp: 4, xpToNext: 6 }, 10);
-    expect(awarded.levelsGained).toBe(1);
-    expect(awarded.progress.level).toBe(2);
-    expect(awarded.progress.xp).toBe(8);
-    expect(awarded.progress.xpToNext).toBe(10);
+    const awarded = awardXpProgress({ level: 1, xp: 4, xpToNext: 5 }, 10);
+    expect(awarded.levelsGained).toBe(2);
+    expect(awarded.progress.level).toBe(3);
+    expect(awarded.progress.xp).toBe(1);
+    expect(awarded.progress.xpToNext).toBe(11);
   });
 
-  it("activates all curated v5 synergies only when requirements are met", () => {
-    const allSynergies = getActiveSynergyIds({
-      incendiaryPayload: 1,
-      volatileHarvest: 1,
-      neurotoxinCoating: 1,
-      ricochetMesh: 1,
-      arcNetwork: 1,
-      steadyAim: 1,
-      guardianDrone: 1,
-      rapidCycle: 1,
-      tungstenCore: 1,
-      vampiricRounds: 1,
-      splitChamber: 1
-    });
+  it("activates curated item synergies only when requirements are met", () => {
+    const allSynergies = getActiveSynergyIds([
+      createItemInstance("incendiaryPayload", "rare", 1, 1),
+      createItemInstance("volatileHarvest", "rare", 1, 1),
+      createItemInstance("neurotoxinCoating", "rare", 1, 1),
+      createItemInstance("ricochetMesh", "rare", 1, 1),
+      createItemInstance("arcNetwork", "epic", 1, 1),
+      createItemInstance("steadyAim", "common", 1, 1),
+      createItemInstance("guardianDrone", "epic", 1, 1),
+      createItemInstance("rapidCycle", "common", 1, 1),
+      createItemInstance("tungstenCore", "rare", 1, 1),
+      createItemInstance("vampiricRounds", "rare", 1, 1),
+      createItemInstance("splitChamber", "common", 1, 1)
+    ]);
 
     expect(allSynergies).toEqual(
       expect.arrayContaining([
@@ -202,22 +210,57 @@ describe("roguelite v5 logic helpers", () => {
       ])
     );
 
-    expect(getActiveSynergyIds({ incendiaryPayload: 1 })).toEqual([]);
+    expect(getActiveSynergyIds([createItemInstance("incendiaryPayload", "rare", 1, 1)])).toEqual([]);
   });
 
-  it("draws unique upgrade cards and filters capped picks out of the pool", () => {
-    const choices = drawUpgradeChoices(
-      [
-        { id: "caliberBoost", label: "", description: "", accent: 0, category: "offense", effects: [], maxStacks: 1 },
-        { id: "rapidCycle", label: "", description: "", accent: 0, category: "offense", effects: [], maxStacks: 1 },
-        { id: "steadyAim", label: "", description: "", accent: 0, category: "offense", effects: [], maxStacks: 1 }
-      ],
-      { caliberBoost: 1 },
-      3,
-      [0, 0.9]
-    );
+  it("draws unique contextual item offers and filters capped stacks", () => {
+    const owned = [
+      createItemInstance("arcNetwork", "epic", 5, 3),
+      createItemInstance("guardianDrone", "epic", 5, 3),
+      createItemInstance("overclockedCore", "legendary", 5, 3)
+    ];
 
-    expect(choices.map((choice) => choice.id)).toEqual(["rapidCycle", "steadyAim"]);
+    const context = buildItemOfferContext({
+      phase: 10,
+      level: 5,
+      characterId: "soldier",
+      items: owned,
+      equippedWeapons: [createEquippedWeapon("pistol", 0), createEquippedWeapon("burstRifle", 1)],
+      stats: buildPlayerStats(owned, "soldier", getActiveSynergyIds(owned))
+    });
+
+    const choices = drawItemChoices(context, [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]);
+    const ids = choices.map((choice) => choice.itemId);
+
+    expect(choices).toHaveLength(3);
+    expect(new Set(ids).size).toBe(3);
+    expect(ids.includes("arcNetwork")).toBe(false);
+    expect(ids.includes("guardianDrone")).toBe(false);
+    expect(ids.includes("overclockedCore")).toBe(false);
+  });
+
+  it("builds readable runtime stats from the real run state", () => {
+    const items = [createItemInstance("rapidCycle", "common", 2, 1), createItemInstance("ceramicArmor", "common", 2, 1)];
+    const stats = buildPlayerStats(items, "tank", getActiveSynergyIds(items));
+    const snapshot = buildDerivedRunStats({
+      hp: 88,
+      stats,
+      selectedItems: items,
+      equippedWeapons: [createEquippedWeapon("shotgun", 0), createEquippedWeapon("pistol", 1)],
+      shieldCharges: stats.maxShieldCharges
+    });
+
+    expect(snapshot.currentHp).toBe(88);
+    expect(snapshot.equippedWeapons).toContain("Shotgun");
+    expect(snapshot.projectileCountMin).toBeGreaterThan(0);
+    expect(snapshot.projectileCountMax).toBeGreaterThanOrEqual(snapshot.projectileCountMin);
+    expect(snapshot.dominantTags.length).toBeGreaterThan(0);
+  });
+
+  it("opens larger recovery windows early and shorter ones later", () => {
+    expect(getPhaseRecoveryWindowMs(2)).toBe(4_000);
+    expect(getPhaseRecoveryWindowMs(8)).toBe(3_250);
+    expect(getPhaseRecoveryWindowMs(18)).toBe(2_400);
   });
 
   it("fires weapon slots independently on their own cooldowns", () => {
@@ -257,7 +300,7 @@ describe("roguelite v5 logic helpers", () => {
     expect(resolved.pending.map((spawn) => spawn.id)).toEqual([2]);
   });
 
-  it("loads and saves the last-character profile with corrupt fallback", () => {
+  it("persists only the last selected character in profile storage", () => {
     const storage = new Map<string, string>();
     const adapter = {
       getItem(key: string) {
@@ -269,11 +312,19 @@ describe("roguelite v5 logic helpers", () => {
     };
 
     expect(loadProfile(adapter)).toEqual({ lastCharacterId: "soldier" });
-
     saveProfile(adapter, { lastCharacterId: "tank" });
     expect(loadProfile(adapter)).toEqual({ lastCharacterId: "tank" });
-
     storage.set("roguelite-v3-profile", "{not-json");
     expect(loadProfile(adapter)).toEqual({ lastCharacterId: "soldier" });
+  });
+
+  it("ramps rarity weights by phase and offer profile", () => {
+    const earlySafe = getRarityWeightsForPhase(2, "safe");
+    const lateBold = getRarityWeightsForPhase(18, "bold");
+
+    expect(earlySafe.common).toBeGreaterThan(earlySafe.rare);
+    expect(lateBold.epic).toBeGreaterThan(earlySafe.epic);
+    expect(lateBold.legendary).toBeGreaterThan(0);
+    expect(Object.values(lateBold).reduce((sum, value) => sum + value, 0)).toBeCloseTo(1);
   });
 });

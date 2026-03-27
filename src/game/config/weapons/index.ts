@@ -8,6 +8,7 @@ import { EXPLOSIVE_WEAPONS } from "./explosive";
 import { ORBITAL_WEAPONS } from "./orbital";
 import { PRECISION_WEAPONS } from "./precision";
 import { SPREAD_WEAPONS } from "./spread";
+import { STARTER_WEAPONS } from "./starters";
 
 const ALL_WEAPON_DEFS: WeaponDef[] = [
   ...BASIC_WEAPONS,
@@ -17,7 +18,8 @@ const ALL_WEAPON_DEFS: WeaponDef[] = [
   ...EXPLOSIVE_WEAPONS,
   ...ORBITAL_WEAPONS,
   ...EXOTIC_WEAPONS,
-  ...EXPERIMENTAL_WEAPONS
+  ...EXPERIMENTAL_WEAPONS,
+  ...STARTER_WEAPONS
 ];
 
 export const WEAPON_ORDER: WeaponId[] = [...WEAPON_IDS];

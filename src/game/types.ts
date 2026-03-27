@@ -27,6 +27,8 @@ export type WeaponFamily =
   | "exotic"
   | "experimental";
 export type WeaponTier = 1 | 2 | 3 | 4;
+export type WeaponRarity = "common" | "rare" | "epic" | "legendary";
+export type WeaponAvailability = "draft" | "starterOnly" | "both";
 export type WeaponBehaviorKind =
   | "ballisticSingle"
   | "ballisticBurst"
@@ -75,13 +77,64 @@ export type BossAttackPatternKind =
   | "orbitingSatellite"
   | "slowFieldPulse";
 
-export type FlowMode = "characterSelect" | "live" | "levelUp" | "weaponDraft" | "phaseTransition" | "gameOver";
+export type FlowMode =
+  | "mainMenu"
+  | "characterSelect"
+  | "live"
+  | "itemDraft"
+  | "weaponDraft"
+  | "phaseTransition"
+  | "statsPanel"
+  | "gameOver";
 
-export type CharacterId = "soldier" | "scout" | "tank";
+export type CharacterId =
+  | "soldier"
+  | "scout"
+  | "tank"
+  | "sniper"
+  | "pyromancer"
+  | "chemist"
+  | "engineer"
+  | "berserker"
+  | "lightningAdept"
+  | "guardian"
+  | "ranger"
+  | "assassin"
+  | "necromancer"
+  | "gladiator"
+  | "alchemist"
+  | "trickster";
+export type DifficultyLabel = "Easy" | "Medium" | "Hard";
 
-export type UpgradeCategory = "offense" | "utility" | "projectile" | "survivability" | "special";
+export type ItemCategory = "offense" | "utility" | "projectile" | "survivability" | "special";
+export type ItemRarity = "common" | "uncommon" | "rare" | "epic" | "legendary";
+export type ItemOfferProfile = "safe" | "synergy" | "bold";
+export type DominantTag =
+  | "damage"
+  | "attackSpeed"
+  | "crit"
+  | "move"
+  | "projectile"
+  | "projectileSpeed"
+  | "spread"
+  | "pierce"
+  | "bounce"
+  | "armor"
+  | "regen"
+  | "shield"
+  | "hp"
+  | "lifesteal"
+  | "xp"
+  | "fire"
+  | "poison"
+  | "lightning"
+  | "explosive"
+  | "drone"
+  | "survival"
+  | WeaponFamily
+  | WeaponTag;
 
-export type UpgradeId =
+export type ItemId =
   | "caliberBoost"
   | "overpressureRounds"
   | "rapidCycle"
@@ -121,7 +174,15 @@ export type UpgradeId =
   | "incendiaryPayload"
   | "neurotoxinCoating"
   | "arcNetwork"
-  | "guardianDrone";
+  | "guardianDrone"
+  | "glassAmplifier"
+  | "steelToes"
+  | "bloodBattery"
+  | "recoilEngine"
+  | "phaseCatalyst"
+  | "fortunaCache"
+  | "stasisShell"
+  | "overclockedCore";
 
 export type SynergyId =
   | "fireExplosion"
@@ -161,6 +222,8 @@ export interface WeaponDef {
   description: string;
   family: WeaponFamily;
   tier: WeaponTier;
+  rarity: WeaponRarity;
+  availability: WeaponAvailability;
   behaviorKind: WeaponBehaviorKind;
   tags: WeaponTag[];
   visualKind: WeaponVisualKind;
@@ -258,13 +321,14 @@ export interface CharacterDef {
   id: CharacterId;
   label: string;
   summary: string;
-  passive: string;
-  weakness: string;
+  difficultyLabel: DifficultyLabel;
+  startingWeaponId: WeaponId;
+  pros: string[];
+  cons: string[];
+  passiveEffects: ItemEffect[];
   accent: number;
   panelTint: number;
-  maxHpMultiplier?: number;
-  moveSpeedMultiplier?: number;
-  attackSpeedMultiplier?: number;
+  portraitTint?: number;
 }
 
 export interface PlayerStats {
@@ -296,29 +360,121 @@ export interface PlayerStats {
   chainLightningTargets: number;
   chainLightningDamageMultiplier: number;
   droneCount: number;
+  dodgeChance: number;
+  summonDamageMultiplier: number;
+  itemLuck: number;
 }
 
-export interface UpgradeEffect {
+export interface ItemEffect {
   stat: keyof PlayerStats;
   mode: "add" | "multiply";
   value: number;
+  polarity: "pro" | "con";
 }
 
-export interface UpgradeDef {
-  id: UpgradeId;
+export interface ItemDef {
+  id: ItemId;
   label: string;
   description: string;
   accent: number;
-  category: UpgradeCategory;
-  effects: UpgradeEffect[];
+  category: ItemCategory;
+  baseRarity: ItemRarity;
+  tags: DominantTag[];
+  pros: string[];
+  cons: string[];
+  offerWeight: number;
+  possibleSynergies: SynergyId[];
+  effects: ItemEffect[];
   maxStacks?: number;
+}
+
+export interface ItemInstance {
+  id: ItemId;
+  rarity: ItemRarity;
+  acquiredAtLevel: number;
+  acquiredAtPhase: number;
+}
+
+export interface ItemOfferContext {
+  phase: number;
+  level: number;
+  characterId: CharacterId;
+  equippedWeapons: WeaponId[];
+  items: ItemInstance[];
+  dominantTags: DominantTag[];
+  currentPower: number;
+  itemLuck: number;
+  recentRarities: ItemRarity[];
+}
+
+export interface ItemOfferChoice {
+  itemId: ItemId;
+  rarity: ItemRarity;
+  profile: ItemOfferProfile;
+}
+
+export interface RarityDef {
+  id: ItemRarity;
+  label: string;
+  accent: number;
+  fill: number;
+  border: number;
+  positiveScale: number;
+  negativeScale: number;
+  offerWeightMultiplier: number;
+  synergyWeightMultiplier: number;
+}
+
+export interface WeaponRarityDef {
+  id: WeaponRarity;
+  label: string;
+  accent: number;
+  fill: number;
+  border: number;
+  description: string;
+}
+
+export interface DominantTagEntry {
+  tag: DominantTag;
+  count: number;
+}
+
+export interface DerivedRunStats {
+  currentHp: number;
+  maxHp: number;
+  damageMultiplier: number;
+  attackSpeedMultiplier: number;
+  critChance: number;
+  critDamageMultiplier: number;
+  moveSpeed: number;
+  projectileCountMin: number;
+  projectileCountMax: number;
+  projectileBonus: number;
+  projectileSpeedMultiplier: number;
+  projectileSizeMultiplier: number;
+  spreadMultiplier: number;
+  pierce: number;
+  bounce: number;
+  knockbackMultiplier: number;
+  armor: number;
+  lifesteal: number;
+  regenPerSecond: number;
+  xpMagnetRadius: number;
+  dodgeChance: number;
+  summonDamageMultiplier: number;
+  itemLuck: number;
+  shieldCharges: number;
+  maxShieldCharges: number;
+  equippedWeapons: string[];
+  dominantTags: DominantTagEntry[];
+  itemCount: number;
 }
 
 export interface SynergyDef {
   id: SynergyId;
   label: string;
   description: string;
-  requires: UpgradeId[][];
+  requires: ItemId[][];
   accent: number;
 }
 
@@ -329,6 +485,7 @@ export interface PersistentProfile {
 export interface EquippedWeapon {
   slotId: number;
   weaponId: WeaponId;
+  rarity: WeaponRarity;
   nextReadyAt: number;
 }
 
@@ -349,7 +506,7 @@ export interface LevelProgress {
 }
 
 export interface QueuedReward {
-  type: "levelUp" | "weaponDraft" | "bossSpawn";
+  type: "itemDraft" | "weaponDraft" | "bossSpawn";
   phase: number;
 }
 
@@ -389,12 +546,13 @@ export interface RunState {
   bannerUntil: number;
   bannerText: string;
   stats: PlayerStats;
+  buildSnapshot: DerivedRunStats;
   gameOver: boolean;
   level: number;
   xp: number;
   xpToNext: number;
-  activeUpgrades: Partial<Record<UpgradeId, number>>;
-  pendingLevelUps: number;
+  selectedItems: ItemInstance[];
+  pendingItemChoices: number;
   queuedRewards: QueuedReward[];
   notifications: Notification[];
   xpOrbs: XpOrbState[];
@@ -407,4 +565,11 @@ export interface RunState {
   lastBossId: BossId | null;
   phaseTransitionEndsAt: number;
   weaponDraftOffer: WeaponDraftOffer | null;
+  currentItemOffer: ItemOfferChoice[] | null;
+  recentRarities: ItemRarity[];
 }
+
+export type UpgradeCategory = ItemCategory;
+export type UpgradeId = ItemId;
+export type UpgradeEffect = ItemEffect;
+export type UpgradeDef = ItemDef;

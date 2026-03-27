@@ -7,10 +7,11 @@ export const DEFAULT_PERSISTENT_PROFILE: PersistentProfile = {
 };
 
 export const STARTING_WEAPON: WeaponId = "pistol";
-export const LEVEL_UP_CARD_COUNT = 3;
+export const ITEM_CARD_COUNT = 3;
+export const LEVEL_UP_CARD_COUNT = ITEM_CARD_COUNT;
 export const WEAPON_DRAFT_CARD_COUNT = 3;
-export const LEVEL_XP_BASE = 6;
-export const LEVEL_XP_PER_LEVEL = 4;
+export const LEVEL_XP_BASE = 5;
+export const LEVEL_XP_PER_LEVEL = 3;
 export const PHASE_COMPLETE_DURATION_MS = 900;
 export const CARD_APPEAR_STAGGER_MS = 120;
 export const NOTIFICATION_DURATION_MS = 2200;
@@ -22,3 +23,4 @@ export const CHAIN_LIGHTNING_RANGE = 180;
 export const DRONE_FIRE_RATE_MS = 1200;
 export const DRONE_ORBIT_RADIUS = 54;
 export const WEAPON_PREVIEW_LOOP_MS = 900;
+export const STATS_PANEL_TOGGLE_KEY = "TAB";

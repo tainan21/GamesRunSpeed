@@ -1,13 +1,15 @@
-import type { CharacterDef } from "../types";
+import { defineCharacter, proAdd, conMul } from "./shared";
 
-export const tank: CharacterDef = {
+export const tank = defineCharacter({
   id: "tank",
   label: "Tank",
-  summary: "Bulky survivor that trades tempo for margin.",
-  passive: "+40% max HP",
-  weakness: "-25% attack speed",
+  summary: "Paredao de curto alcance que troca ritmo por sobrevivencia.",
+  difficultyLabel: "Easy",
+  startingWeaponId: "shotgun",
+  pros: ["+40 max HP", "+15 armor"],
+  cons: ["-20% attack speed"],
+  passiveEffects: [proAdd("maxHp", 40), proAdd("armor", 15), conMul("attackSpeedMultiplier", 0.8)],
   accent: 0xe19886,
   panelTint: 0x5a4f49,
-  maxHpMultiplier: 1.4,
-  attackSpeedMultiplier: 0.75
-};
+  portraitTint: 0xf0d0c4
+});

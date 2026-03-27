@@ -1,7 +1,5 @@
-import { CHARACTERS } from "./characters";
 import { BOSS_ORDER, BOSSES } from "./config/boss";
-import { PHASE_MIXES, BOSS_PHASE_INTERVAL, PHASE_DURATION_MS, WEAPON_DRAFT_PHASE_INTERVAL } from "./config/phases";
-import { BASE_PLAYER_STATS } from "./config/player";
+import { PHASE_MIXES, BOSS_PHASE_INTERVAL, WEAPON_DRAFT_PHASE_INTERVAL } from "./config/phases";
 import {
   BURST_WAVE_BASE_COUNT,
   BURST_WAVE_COUNT_CAP,
@@ -18,23 +16,33 @@ import {
   SPAWN_RATE_DOUBLE_PHASE,
   SPAWN_RATE_PER_PHASE
 } from "./config/spawnCurve";
-import { LEVEL_XP_BASE, LEVEL_XP_PER_LEVEL } from "./config/progression";
-import { SYNERGY_POOL } from "./config/synergies";
-import { UPGRADE_BY_ID } from "./config/upgrades";
 import { WEAPONS } from "./config/weapons";
+import { drawItemChoices as drawContextualItemChoices } from "./offers";
+import { getBossCountForPhase, getPhaseRecoveryWindowMs, getRarityWeightsForPhase, getXpToNextLevel } from "./retention";
+import {
+  buildDerivedRunStats,
+  buildPlayerStats,
+  estimateBuildPower,
+  getDominantBuildTags,
+  getItemStacks,
+  getOwnedItemIds
+} from "./stats";
 import type {
   BossId,
   CharacterDef,
   CharacterId,
+  DerivedRunStats,
   EquippedWeapon,
+  ItemId,
+  ItemInstance,
+  ItemOfferChoice,
+  ItemOfferContext,
   LevelProgress,
   PendingSpawn,
   PlayerStats,
   QueuedReward,
   SynergyId,
   TargetLike,
-  UpgradeDef,
-  UpgradeId,
   WeaponId,
   WeightedEnemyMix
 } from "./types";
@@ -51,6 +59,9 @@ function chooseFromPool<T>(pool: T[], roll = Math.random()): T {
   const index = Math.min(pool.length - 1, Math.floor(clamp(roll, 0, 0.999999) * pool.length));
   return pool[index];
 }
+
+export { buildDerivedRunStats, buildPlayerStats, getDominantBuildTags, getItemStacks, getOwnedItemIds, getRarityWeightsForPhase };
+export { getPhaseRecoveryWindowMs, getXpToNextLevel } from "./retention";
 
 export function getPhaseEnemyCap(phase: number): number {
   if (phase <= DENSITY_CAP_MILESTONES[0].phase) {
@@ -73,7 +84,6 @@ export function getPhaseEnemyCap(phase: number): number {
 
 export function getPhaseMix(phase: number): WeightedEnemyMix {
   const entry = PHASE_MIXES.find(({ maxPhase }) => phase <= maxPhase);
-
   return entry ? entry.mix : PHASE_MIXES[PHASE_MIXES.length - 1].mix;
 }
 
@@ -146,10 +156,6 @@ export function getBossHealthMultiplier(phase: number): number {
   return 1 + phase * 0.2;
 }
 
-export function getXpToNextLevel(level: number): number {
-  return LEVEL_XP_BASE + Math.max(0, level - 1) * LEVEL_XP_PER_LEVEL;
-}
-
 export function awardXpProgress(progress: LevelProgress, amount: number): { progress: LevelProgress; levelsGained: number } {
   let nextProgress: LevelProgress = {
     level: progress.level,
@@ -170,11 +176,11 @@ export function awardXpProgress(progress: LevelProgress, amount: number): { prog
   return { progress: nextProgress, levelsGained };
 }
 
-export function buildPhaseRewardQueue(phase: number, pendingLevelUps: number): QueuedReward[] {
+export function buildPhaseRewardQueue(phase: number, pendingItemChoices: number): QueuedReward[] {
   const rewards: QueuedReward[] = [];
 
-  for (let index = 0; index < pendingLevelUps; index += 1) {
-    rewards.push({ type: "levelUp", phase });
+  for (let index = 0; index < pendingItemChoices; index += 1) {
+    rewards.push({ type: "itemDraft", phase });
   }
 
   if (isWeaponDraftPhase(phase)) {
@@ -225,101 +231,59 @@ export function findNearestTarget<T extends TargetLike>(
   return bestTarget;
 }
 
-export function applyCharacterToStats(stats: PlayerStats, character: CharacterDef): PlayerStats {
+export function getActiveSynergyIds(selectedItems: ItemInstance[]): SynergyId[] {
+  const ownedIds = new Set(selectedItems.map((item) => item.id));
+  const hasAny = (...ids: ItemId[]) => ids.some((id) => ownedIds.has(id));
+
+  const active: SynergyId[] = [];
+
+  if (hasAny("incendiaryPayload") && hasAny("volatileHarvest")) active.push("fireExplosion");
+  if (hasAny("neurotoxinCoating") && hasAny("ricochetMesh")) active.push("toxicRicochet");
+  if (hasAny("arcNetwork") && hasAny("steadyAim", "killScope")) active.push("critStorm");
+  if (hasAny("guardianDrone") && hasAny("rapidCycle", "combatStims")) active.push("droneOverclock");
+  if (hasAny("tungstenCore", "railCore") && hasAny("ricochetMesh")) active.push("piercingRicochet");
+  if (hasAny("vampiricRounds") && hasAny("rapidCycle", "combatStims")) active.push("vampiricBarrage");
+  if (hasAny("volatileHarvest") && hasAny("splitChamber", "mirrorChamber", "stormBarrel", "vectorArray")) active.push("blastFragmentation");
+  if (hasAny("incendiaryPayload") && hasAny("neurotoxinCoating")) active.push("toxicFirestorm");
+
+  return active;
+}
+
+export function buildItemOfferContext(args: {
+  phase: number;
+  level: number;
+  characterId: CharacterId;
+  items: ItemInstance[];
+  equippedWeapons: EquippedWeapon[];
+  stats: PlayerStats;
+}): ItemOfferContext {
+  const dominantTags = getDominantBuildTags(args.items, args.equippedWeapons).map((entry) => entry.tag);
+  const currentPower = estimateBuildPower(args.stats, args.equippedWeapons);
+
   return {
-    ...stats,
-    maxHp: Math.round(stats.maxHp * (character.maxHpMultiplier ?? 1)),
-    moveSpeed: stats.moveSpeed * (character.moveSpeedMultiplier ?? 1),
-    attackSpeedMultiplier: stats.attackSpeedMultiplier * (character.attackSpeedMultiplier ?? 1)
+    phase: args.phase,
+    level: args.level,
+    characterId: args.characterId,
+    equippedWeapons: args.equippedWeapons.map((weapon) => weapon.weaponId),
+    items: args.items,
+    dominantTags,
+    currentPower,
+    itemLuck: args.stats.itemLuck,
+    recentRarities: args.items.slice(-4).map((item) => item.rarity)
   };
 }
 
-function applyUpgradeEffects(stats: PlayerStats, upgradeId: UpgradeId, count: number): PlayerStats {
-  const definition = UPGRADE_BY_ID[upgradeId];
-  let nextStats = { ...stats };
-
-  for (let index = 0; index < count; index += 1) {
-    nextStats = definition.effects.reduce<PlayerStats>((workingStats, effect) => {
-      const currentValue = workingStats[effect.stat];
-      const numericValue = typeof currentValue === "number" ? currentValue : 0;
-      const updatedValue = effect.mode === "add" ? numericValue + effect.value : numericValue * effect.value;
-
-      return {
-        ...workingStats,
-        [effect.stat]: updatedValue
-      };
-    }, nextStats);
-  }
-
-  return nextStats;
+export function drawItemChoices(context: ItemOfferContext, rolls: number[] = []): ItemOfferChoice[] {
+  return drawContextualItemChoices(context, rolls);
 }
 
-export function getActiveSynergyIds(selected: Partial<Record<UpgradeId, number>>): SynergyId[] {
-  return SYNERGY_POOL.filter((synergy) =>
-    synergy.requires.every((requirementGroup) => requirementGroup.some((upgradeId) => (selected[upgradeId] ?? 0) > 0))
-  ).map((synergy) => synergy.id);
-}
-
-export function buildPlayerStats(
-  selected: Partial<Record<UpgradeId, number>>,
-  character: CharacterId | CharacterDef,
-  activeSynergyIds: SynergyId[] = getActiveSynergyIds(selected)
-): PlayerStats {
-  const characterDef = typeof character === "string" ? CHARACTERS[character] : character;
-  let stats = applyCharacterToStats({ ...BASE_PLAYER_STATS }, characterDef);
-
-  for (const [upgradeId, rawCount] of Object.entries(selected) as Array<[UpgradeId, number | undefined]>) {
-    const count = rawCount ?? 0;
-
-    if (count <= 0) {
-      continue;
-    }
-
-    stats = applyUpgradeEffects(stats, upgradeId, count);
-  }
-
-  if (activeSynergyIds.includes("critStorm")) {
-    stats.chainLightningChance += 0.12;
-    stats.chainLightningTargets += 1;
-  }
-
-  if (activeSynergyIds.includes("vampiricBarrage")) {
-    stats.lifeSteal += 0.02;
-    stats.attackSpeedMultiplier += 0.08;
-  }
-
-  if (activeSynergyIds.includes("toxicFirestorm")) {
-    stats.fireDps += 1;
-    stats.poisonDps += 1;
-  }
-
-  return stats;
-}
-
-export function drawUpgradeChoices(
-  pool: UpgradeDef[],
-  selected: Partial<Record<UpgradeId, number>>,
-  count: number,
-  rolls: number[] = []
-): UpgradeDef[] {
-  const eligible = pool.filter((upgrade) => {
-    const current = selected[upgrade.id] ?? 0;
-    const maxStacks = upgrade.maxStacks ?? 1;
-
-    return current < maxStacks;
-  });
-  const remaining = [...eligible];
-  const choices: UpgradeDef[] = [];
-
-  for (let index = 0; index < count && remaining.length > 0; index += 1) {
-    const roll = rolls[index] ?? Math.random();
-    const choiceIndex = Math.min(remaining.length - 1, Math.floor(clamp(roll, 0, 0.999999) * remaining.length));
-    const [choice] = remaining.splice(choiceIndex, 1);
-
-    choices.push(choice);
-  }
-
-  return choices;
+export function createItemInstance(itemId: ItemId, rarity: ItemOfferChoice["rarity"], level: number, phase: number): ItemInstance {
+  return {
+    id: itemId,
+    rarity,
+    acquiredAtLevel: level,
+    acquiredAtPhase: phase
+  };
 }
 
 export function getUnlockedWeaponTier(phase: number): 1 | 2 | 3 | 4 {
@@ -332,17 +296,12 @@ export function getUnlockedWeaponTier(phase: number): 1 | 2 | 3 | 4 {
 export function getUnlockedWeaponPool(phase: number): WeaponId[] {
   const maxTier = getUnlockedWeaponTier(phase);
   return Object.values(WEAPONS)
-    .filter((weapon) => weapon.tier <= maxTier)
+    .filter((weapon) => weapon.tier <= maxTier && weapon.availability !== "starterOnly")
     .sort((a, b) => a.tier - b.tier || a.label.localeCompare(b.label))
     .map((weapon) => weapon.id);
 }
 
-export function drawWeaponChoices(
-  phase: number,
-  ownedWeapons: WeaponId[],
-  count: number,
-  rolls: number[] = []
-): WeaponId[] {
+export function drawWeaponChoices(phase: number, ownedWeapons: WeaponId[], count: number, rolls: number[] = []): WeaponId[] {
   const unlocked = getUnlockedWeaponPool(phase);
   const remainingFresh = unlocked.filter((weaponId) => !ownedWeapons.includes(weaponId));
   const freshPool = [...remainingFresh];
@@ -374,16 +333,26 @@ export function drawWeaponChoices(
   return choices;
 }
 
-export function createEquippedWeapon(weaponId: WeaponId, slotId: number): EquippedWeapon {
+export function createEquippedWeapon(
+  weaponId: WeaponId,
+  slotId: number,
+  rarity = WEAPONS[weaponId].rarity
+): EquippedWeapon {
   return {
     slotId,
     weaponId,
+    rarity,
     nextReadyAt: 0
   };
 }
 
-export function appendEquippedWeapon(equippedWeapons: EquippedWeapon[], weaponId: WeaponId, nextSlotId: number): EquippedWeapon[] {
-  return [...equippedWeapons, createEquippedWeapon(weaponId, nextSlotId)];
+export function appendEquippedWeapon(
+  equippedWeapons: EquippedWeapon[],
+  weaponId: WeaponId,
+  nextSlotId: number,
+  rarity = WEAPONS[weaponId].rarity
+): EquippedWeapon[] {
+  return [...equippedWeapons, createEquippedWeapon(weaponId, nextSlotId, rarity)];
 }
 
 export function getReadyWeapons(
@@ -425,6 +394,10 @@ export function getBossIdForPhase(phase: number, lastBossId: BossId | null, roll
   return chooseFromPool(pool, roll);
 }
 
+export function getBossCountForBossPhase(phase: number): number {
+  return getBossCountForPhase(phase);
+}
+
 export function pickSpawnPoint(
   width: number,
   height: number,
@@ -457,10 +430,7 @@ export function pickSpawnPoint(
   return null;
 }
 
-export function resolvePendingSpawns(
-  pending: PendingSpawn[],
-  time: number
-): { ready: PendingSpawn[]; pending: PendingSpawn[] } {
+export function resolvePendingSpawns(pending: PendingSpawn[], time: number): { ready: PendingSpawn[]; pending: PendingSpawn[] } {
   const ready: PendingSpawn[] = [];
   const remaining: PendingSpawn[] = [];
 
@@ -476,8 +446,4 @@ export function resolvePendingSpawns(
     ready,
     pending: remaining
   };
-}
-
-export function getPhaseTimerRemaining(time: number, phaseStartedAt: number): number {
-  return Math.max(0, PHASE_DURATION_MS - (time - phaseStartedAt));
 }

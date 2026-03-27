@@ -38,7 +38,20 @@ export const WEAPON_IDS = [
   "temporalRepeater",
   "gravityCannon",
   "shatterRifle",
-  "novaEmitter"
+  "novaEmitter",
+  "assaultRifle",
+  "sniperRifle",
+  "acidSprayer",
+  "turretLauncher",
+  "dualBlades",
+  "lightningStaff",
+  "shieldBlaster",
+  "longbow",
+  "throwingDaggers",
+  "boneWand",
+  "spear",
+  "bombLauncher",
+  "ricochetGun"
 ] as const;
 
 export const BOSS_IDS = [
