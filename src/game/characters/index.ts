@@ -31,8 +31,7 @@ export const CHARACTERS: Record<CharacterId, CharacterDef> = {
   soldier,
   scout,
   sniper,
-  tank
-  ,
+  tank,
   trickster
 };
 

@@ -1,0 +1,31 @@
+export const PLAYER_BULLET_POOL_SIZE = 1_500;
+export const ENEMY_BULLET_POOL_SIZE = 520;
+export const ENEMY_POOL_SIZE = 240;
+export const XP_ORB_POOL_SIZE = 500;
+
+export const FX_PARTICLE_POOL_SIZE = 220;
+export const FX_TRAIL_POOL_SIZE = 180;
+export const FX_MUZZLE_FLASH_POOL_SIZE = 48;
+export const FX_GHOST_POOL_SIZE = 40;
+
+export const MAX_PARTICLES_PER_BURST = 6;
+export const MAX_SIMULTANEOUS_PARTICLES = 160;
+export const MAX_SIMULTANEOUS_TRAILS = 120;
+export const MAX_SIMULTANEOUS_MUZZLE_FLASHES = 32;
+export const MAX_SIMULTANEOUS_GHOSTS = 24;
+
+export const IMPACT_EFFECT_THROTTLE_MS = 24;
+export const PROJECTILE_TRAIL_INTERVAL_MS = 60;
+export const HUD_UPDATE_INTERVAL_MS = 120;
+
+export const XP_BASE_MERGE_RADIUS = 34;
+export const XP_HIGH_DENSITY_THRESHOLD = 90;
+export const XP_HIGH_DENSITY_MERGE_RADIUS = 68;
+export const XP_FORCE_MERGE_THRESHOLD = 180;
+
+export const ENEMY_NEAR_DISTANCE = 260;
+export const ENEMY_MID_DISTANCE = 520;
+export const ENEMY_MID_UPDATE_INTERVAL_MS = 60;
+export const ENEMY_FAR_UPDATE_INTERVAL_MS = 120;
+
+export const ENEMY_GRID_CELL_SIZE = 96;

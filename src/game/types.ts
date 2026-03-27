@@ -376,14 +376,17 @@ export interface ItemDef {
   id: ItemId;
   label: string;
   description: string;
+  shortDescription?: string;
   accent: number;
   category: ItemCategory;
   baseRarity: ItemRarity;
+  displayIconKey?: string;
   tags: DominantTag[];
   pros: string[];
   cons: string[];
   offerWeight: number;
   possibleSynergies: SynergyId[];
+  synergyHint?: string;
   effects: ItemEffect[];
   maxStacks?: number;
 }
@@ -439,6 +442,34 @@ export interface DominantTagEntry {
   count: number;
 }
 
+export type StatPolarity = "positive" | "negative" | "neutral";
+
+export interface BuildStatLine {
+  label: string;
+  value: string;
+  polarity: StatPolarity;
+}
+
+export interface BuildInventoryEntry {
+  kind: "item" | "passive";
+  id: string;
+  label: string;
+  rarityLabel?: string;
+  categoryLabel: string;
+  shortDescription: string;
+  pros: string[];
+  cons: string[];
+  tags: string[];
+  synergies: string[];
+  stackCount: number;
+  isUnique: boolean;
+  iconKey?: string;
+  accent: number;
+  fill: number;
+  border: number;
+  footerHint: string;
+}
+
 export interface DerivedRunStats {
   currentHp: number;
   maxHp: number;
@@ -468,6 +499,13 @@ export interface DerivedRunStats {
   equippedWeapons: string[];
   dominantTags: DominantTagEntry[];
   itemCount: number;
+  offenseLines: BuildStatLine[];
+  defenseLines: BuildStatLine[];
+  utilityLines: BuildStatLine[];
+  inventoryEntries: BuildInventoryEntry[];
+  uniqueItemLabels: string[];
+  uniquePassiveLabels: string[];
+  synergyLabels: string[];
 }
 
 export interface SynergyDef {

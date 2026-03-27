@@ -10,20 +10,40 @@ import {
   DRONE_FIRE_RATE_MS,
   DRONE_ORBIT_RADIUS,
   ENEMIES,
+  ENEMY_BULLET_POOL_SIZE,
   ENEMY_BULLET_LIFETIME_MS,
+  ENEMY_FAR_UPDATE_INTERVAL_MS,
+  ENEMY_GRID_CELL_SIZE,
+  ENEMY_MID_DISTANCE,
+  ENEMY_MID_UPDATE_INTERVAL_MS,
+  ENEMY_NEAR_DISTANCE,
+  ENEMY_POOL_SIZE,
+  FX_GHOST_POOL_SIZE,
+  FX_MUZZLE_FLASH_POOL_SIZE,
+  FX_PARTICLE_POOL_SIZE,
+  FX_TRAIL_POOL_SIZE,
   FIRE_TICK_MS,
+  HUD_UPDATE_INTERVAL_MS,
+  IMPACT_EFFECT_THROTTLE_MS,
   ITEM_BY_ID,
   ITEM_CARD_COUNT,
   ITEM_RARITIES,
   MAX_PENDING_SPAWNS,
+  MAX_PARTICLES_PER_BURST,
+  MAX_SIMULTANEOUS_GHOSTS,
+  MAX_SIMULTANEOUS_MUZZLE_FLASHES,
+  MAX_SIMULTANEOUS_PARTICLES,
+  MAX_SIMULTANEOUS_TRAILS,
   NOTIFICATION_DURATION_MS,
   PHASE_COMPLETE_DURATION_MS,
   PHASE_DURATION_MS,
+  PLAYER_BULLET_POOL_SIZE,
   PLAYER_BULLET_LIFETIME_MS,
   PLAYER_BULLET_OFFSCREEN_MARGIN,
   PLAYER_IFRAME_MS,
   PLAYER_RADIUS,
   POISON_TICK_MS,
+  PROJECTILE_TRAIL_INTERVAL_MS,
   PROFILE_STORAGE_KEY,
   PROJECTILE_BOUNCE_RANGE,
   SPAWN_MARKER_SPACING,
@@ -37,9 +57,15 @@ import {
   WEAPON_RARITIES,
   WEAPONS,
   WEAPON_ORDER,
+  XP_BASE_MERGE_RADIUS,
+  XP_FORCE_MERGE_THRESHOLD,
+  XP_HIGH_DENSITY_MERGE_RADIUS,
+  XP_HIGH_DENSITY_THRESHOLD,
+  XP_ORB_POOL_SIZE,
   XP_TOUCH_RADIUS
 } from "./config";
 import { SYNERGY_BY_ID } from "./config/synergies";
+import { EnemySpatialGrid } from "./enemyGrid";
 import {
   appendEquippedWeapon,
   awardXpProgress,
@@ -69,11 +95,12 @@ import {
   getXpToNextLevel,
   isBossTriggerPhase,
   pickSpawnPoint,
-  resolvePendingSpawns,
   stepSpawnAccumulator
 } from "./logic";
 import { loadProfile, saveProfile } from "./profile";
 import type {
+  BuildInventoryEntry,
+  BuildStatLine,
   BossDef,
   BossId,
   CharacterId,
@@ -120,6 +147,7 @@ interface EnemySprite extends Phaser.Physics.Arcade.Image, TargetLike {
   nextBurnTickAt: number;
   poisonUntil: number;
   nextPoisonTickAt: number;
+  nextLogicAt: number;
 }
 
 interface BulletSprite extends Phaser.Physics.Arcade.Image {
@@ -162,6 +190,17 @@ interface FloatingText extends Phaser.GameObjects.Text {
   expiresAt: number;
 }
 
+interface FxSprite extends Phaser.GameObjects.Image {
+  effectCreatedAt: number;
+  effectExpiresAt: number;
+  effectVelocityX: number;
+  effectVelocityY: number;
+  effectStartAlpha: number;
+  effectEndAlpha: number;
+  effectStartScale: number;
+  effectEndScale: number;
+}
+
 interface QueuedBurst {
   weaponId: WeaponId;
   remainingShots: number;
@@ -200,6 +239,19 @@ interface ActiveHazard {
   nextTickAt: number;
   expiresAt: number;
   gfx: Phaser.GameObjects.Graphics;
+}
+
+interface OverlayLayoutMetrics {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  density: "comfortable" | "compact";
+}
+
+interface FocusableOverlayEntry extends Phaser.GameObjects.Container {
+  setFocused: (focused: boolean) => void;
+  select: () => void;
 }
 
 export class GameScene extends Phaser.Scene {
@@ -247,9 +299,55 @@ export class GameScene extends Phaser.Scene {
   private menuScreen: "main" | "about" | "settings" = "main";
   private drones: DroneSprite[] = [];
   private hazards: ActiveHazard[] = [];
+  private trailEffects: FxSprite[] = [];
+  private particleEffects: FxSprite[] = [];
+  private muzzleFlashEffects: FxSprite[] = [];
+  private ghostEffects: FxSprite[] = [];
+  private readonly enemyGrid = new EnemySpatialGrid<EnemySprite>(ENEMY_GRID_CELL_SIZE);
+  private readonly activeEnemiesScratch: EnemySprite[] = [];
+  private readonly nearbyEnemiesScratch: EnemySprite[] = [];
+  private readonly pendingSpawnPointsScratch: Array<{ x: number; y: number }> = [];
+  private cachedNearestEnemy: EnemySprite | null = null;
+  private cachedPlayerX = VIEW_WIDTH / 2;
+  private cachedPlayerY = VIEW_HEIGHT / 2;
+  private activeEnemyCountCache = 0;
+  private activeNormalEnemyCountCache = 0;
+  private activeParticleCount = 0;
+  private activeTrailCount = 0;
+  private activeMuzzleFlashCount = 0;
+  private activeGhostCount = 0;
+  private nextHudRefreshAt = 0;
+  private hudForceRefresh = true;
+  private lastHpRatio = -1;
+  private lastXpRatio = -1;
+  private lastHudMode: string | null = null;
+  private lastHudHint = "";
+  private lastHpLabel = "";
+  private lastXpLabel = "";
+  private lastLevelLabel = "";
+  private lastPhaseLabel = "";
+  private lastTimerLabel = "";
+  private lastEnemyCountLabel = "";
+  private lastBuildSummaryLabel = "";
+  private lastImpactBurstAt = 0;
   private livePauseStartedAt: number | null = null;
   private phaseStartPending = false;
   private lastWeaponStripSignature = "";
+  private overlayInputMode: "mouse" | "keyboard" = "mouse";
+  private characterEntries: FocusableOverlayEntry[] = [];
+  private characterGridColumns = 1;
+  private characterFocusIndex = 0;
+  private draftEntries: FocusableOverlayEntry[] = [];
+  private draftFocusIndex = 0;
+  private statsEntries: FocusableOverlayEntry[] = [];
+  private statsGridColumns = 1;
+  private statsFocusIndex = 0;
+  private statsDetailTitle?: Phaser.GameObjects.Text;
+  private statsDetailMeta?: Phaser.GameObjects.Text;
+  private statsDetailDescription?: Phaser.GameObjects.Text;
+  private statsDetailPros?: Phaser.GameObjects.Text;
+  private statsDetailCons?: Phaser.GameObjects.Text;
+  private statsDetailFooter?: Phaser.GameObjects.Text;
 
   constructor() {
     super("GameScene");
@@ -271,6 +369,7 @@ export class GameScene extends Phaser.Scene {
   }
 
   update(time: number, delta: number): void {
+    this.updateImageEffects(time, delta);
     this.updateFloatingTexts(delta, time);
     this.updateBanner(time);
     this.updateNotificationsUi(time);
@@ -286,6 +385,7 @@ export class GameScene extends Phaser.Scene {
         this.openMainMenu();
         return;
       }
+      this.handleCharacterSelectionInput();
       if (Phaser.Input.Keyboard.JustDown(this.keys.space) || Phaser.Input.Keyboard.JustDown(this.keys.enter)) {
         this.startRun(this.selectedCharacterId);
       }
@@ -310,6 +410,7 @@ export class GameScene extends Phaser.Scene {
     }
 
     if (this.run.flowMode === "itemDraft" || this.run.flowMode === "weaponDraft") {
+      this.handleDraftFocusInput();
       this.updateHud(time);
       return;
     }
@@ -317,23 +418,28 @@ export class GameScene extends Phaser.Scene {
     if (this.run.flowMode === "statsPanel") {
       if (Phaser.Input.Keyboard.JustDown(this.keys.tab) || Phaser.Input.Keyboard.JustDown(this.keys.escape)) {
         this.closeStatsPanel();
+      } else {
+        this.handleStatsPanelFocusInput();
       }
       this.updateHud(time);
       return;
     }
 
     if (Phaser.Input.Keyboard.JustDown(this.keys.tab)) {
-      this.openStatsPanel();
+      this.openStatsPanelResponsive();
       this.updateHud(time);
       return;
     }
 
     this.updatePlayerMovement();
     this.updatePlayerPose();
+    this.cachedPlayerX = this.player.x;
+    this.cachedPlayerY = this.player.y;
     this.updatePlayerRegeneration(delta);
     this.updatePlayerFlash(time);
     this.updateXpOrbs(time, delta);
     this.updatePendingSpawns(time);
+    this.refreshEnemySpatialState();
     this.tryScheduleNormalSpawn(time, delta);
     this.updateEnemies(time);
     this.tryFireWeapons(time);
@@ -623,10 +729,10 @@ export class GameScene extends Phaser.Scene {
   }
 
   private createGroups(): void {
-    this.enemies = this.physics.add.group({ runChildUpdate: false });
-    this.playerBullets = this.physics.add.group({ classType: Phaser.Physics.Arcade.Image, maxSize: 1_500, runChildUpdate: false });
-    this.enemyBullets = this.physics.add.group({ classType: Phaser.Physics.Arcade.Image, maxSize: 520, runChildUpdate: false });
-    this.xpOrbs = this.physics.add.group({ classType: Phaser.Physics.Arcade.Image, maxSize: 500, runChildUpdate: false });
+    this.enemies = this.physics.add.group({ classType: Phaser.Physics.Arcade.Image, maxSize: ENEMY_POOL_SIZE, runChildUpdate: false });
+    this.playerBullets = this.physics.add.group({ classType: Phaser.Physics.Arcade.Image, maxSize: PLAYER_BULLET_POOL_SIZE, runChildUpdate: false });
+    this.enemyBullets = this.physics.add.group({ classType: Phaser.Physics.Arcade.Image, maxSize: ENEMY_BULLET_POOL_SIZE, runChildUpdate: false });
+    this.xpOrbs = this.physics.add.group({ classType: Phaser.Physics.Arcade.Image, maxSize: XP_ORB_POOL_SIZE, runChildUpdate: false });
   }
 
   private createPlayer(): void {
@@ -685,11 +791,11 @@ export class GameScene extends Phaser.Scene {
     this.hpLabelText = this.add.text(34, 8, "HP", labelStyle).setDepth(42);
     this.xpLabelText = this.add.text(34, 40, "XP", labelStyle).setDepth(42);
     this.levelText = this.add.text(262, 40, "LV 1", labelStyle).setDepth(42).setOrigin(1, 0);
-    this.phaseText = this.add.text(VIEW_WIDTH - 34, 12, "PHASE 1", titleStyle).setOrigin(1, 0).setDepth(42);
+    this.phaseText = this.add.text(VIEW_WIDTH - 34, 12, "FASE 1", titleStyle).setOrigin(1, 0).setDepth(42);
     this.timerText = this.add.text(VIEW_WIDTH - 34, 44, "00:40", labelStyle).setOrigin(1, 0).setDepth(42);
-    this.enemyCountText = this.add.text(VIEW_WIDTH - 34, 68, "ENEMIES 0", smallStyle).setOrigin(1, 0).setDepth(42);
+    this.enemyCountText = this.add.text(VIEW_WIDTH - 34, 68, "INIMIGOS 0", smallStyle).setOrigin(1, 0).setDepth(42);
     this.buildSummaryText = this.add
-      .text(VIEW_WIDTH / 2, VIEW_HEIGHT - 92, "BUILD  STARTER LOADOUT", {
+      .text(VIEW_WIDTH / 2, VIEW_HEIGHT - 92, "BUILD  CARGA INICIAL", {
         fontFamily: "Trebuchet MS",
         fontSize: "13px",
         color: "#cdd8d1",
@@ -701,14 +807,14 @@ export class GameScene extends Phaser.Scene {
       .setDepth(42)
       .setAlpha(0.82);
     this.weaponStripContainer = this.add.container(VIEW_WIDTH / 2, VIEW_HEIGHT - 52).setDepth(42);
-    this.hintText = this.add.text(28, VIEW_HEIGHT - 22, "MOVE - WASD / ARROWS", smallStyle).setDepth(42).setOrigin(0, 1).setAlpha(0.82);
+    this.hintText = this.add.text(28, VIEW_HEIGHT - 22, "MOVA  WASD / SETAS", smallStyle).setDepth(42).setOrigin(0, 1).setAlpha(0.82);
     this.statsButtonPanel = this.add
       .rectangle(116, VIEW_HEIGHT - 58, 156, 34, 0x141a18, 0.94)
       .setStrokeStyle(2, 0x7aa0a3, 0.46)
       .setDepth(42)
       .setInteractive({ cursor: "pointer" });
     this.statsButtonText = this.add
-      .text(116, VIEW_HEIGHT - 58, "TAB  BUILD STATS", {
+      .text(116, VIEW_HEIGHT - 58, "TAB  BUILD", {
         fontFamily: "Trebuchet MS",
         fontSize: "14px",
         color: "#dce7e2",
@@ -776,7 +882,6 @@ export class GameScene extends Phaser.Scene {
     this.physics.add.overlap(this.playerBullets, this.enemies, (a, b) => this.handlePlayerBulletHit(a as BulletSprite, b as EnemySprite));
     this.physics.add.overlap(this.player, this.enemies, (_player, enemy) => this.handlePlayerEnemyContact(enemy as EnemySprite));
     this.physics.add.overlap(this.player, this.enemyBullets, (_player, bullet) => this.handleEnemyBulletHit(bullet as BulletSprite));
-    this.physics.add.overlap(this.player, this.xpOrbs, (_player, orb) => this.collectXpOrb(orb as XpOrbSprite));
   }
 
   private initializeState(): void {
@@ -815,7 +920,9 @@ export class GameScene extends Phaser.Scene {
         stats,
         selectedItems,
         equippedWeapons,
-        shieldCharges
+        shieldCharges,
+        selectedCharacterId: characterId,
+        activeSynergyIds
       }),
       gameOver: false,
       level: 1,
@@ -860,6 +967,11 @@ export class GameScene extends Phaser.Scene {
     this.playerSlowMultiplier = 1;
     this.livePauseStartedAt = null;
     this.phaseStartPending = false;
+    this.cachedNearestEnemy = null;
+    this.activeEnemyCountCache = 0;
+    this.activeNormalEnemyCountCache = 0;
+    this.hudForceRefresh = true;
+    this.nextHudRefreshAt = 0;
     const character = CHARACTERS[characterId];
     const startingWeapon = WEAPONS[character.startingWeaponId];
     this.pushNotification(
@@ -891,6 +1003,11 @@ export class GameScene extends Phaser.Scene {
     this.clearHazards();
     this.player.setVelocity(0, 0);
     this.lastWeaponStripSignature = "";
+    this.cachedNearestEnemy = null;
+    this.activeEnemyCountCache = 0;
+    this.activeNormalEnemyCountCache = 0;
+    this.pendingSpawnPointsScratch.length = 0;
+    this.hudForceRefresh = true;
   }
 
   private refreshBuildSnapshot(): void {
@@ -899,8 +1016,11 @@ export class GameScene extends Phaser.Scene {
       stats: this.run.stats,
       selectedItems: this.run.selectedItems,
       equippedWeapons: this.run.equippedWeapons,
-      shieldCharges: this.run.shieldCharges
+      shieldCharges: this.run.shieldCharges,
+      selectedCharacterId: this.selectedCharacterId,
+      activeSynergyIds: this.run.activeSynergyIds
     });
+    this.hudForceRefresh = true;
   }
 
   private rebuildCombatStats(): void {
@@ -917,7 +1037,8 @@ export class GameScene extends Phaser.Scene {
     this.player.setVisible(false);
     this.player.setVelocity(0, 0);
     this.clearOverlay();
-    this.createModalFrame("ROGUELITE WEB", "A sobrevivencia comeca aqui. Escolha um personagem, entre com uma arma inicial forte e empilhe caos legivel run apos run.");
+    this.hudForceRefresh = true;
+    this.createModalFrame("ROGUELITE WEB", "A sobrevivência começa aqui. Escolha um personagem, entre com uma arma inicial forte e empilhe caos legível run após run.");
 
     const createMenuAction = (
       label: string,
@@ -929,28 +1050,28 @@ export class GameScene extends Phaser.Scene {
       this.createActionButton(VIEW_WIDTH / 2, y, 336, 54, label, accent, onSelect, disabled);
     };
 
-    createMenuAction("PLAY", 258, 0xcfe09a, () => this.openCharacterSelect());
+    createMenuAction("JOGAR", 258, 0xcfe09a, () => this.openCharacterSelect());
     createMenuAction("MULTIPLAYER LOCAL", 330, 0x6d7a76, () => undefined, true);
     createMenuAction("MULTIPLAYER ONLINE", 402, 0x6d7a76, () => undefined, true);
     createMenuAction(
-      "ABOUT",
+      "SOBRE",
       492,
       0x88b8d8,
-      () => this.openStaticMenuPanel("ABOUT", "Top-down survival roguelite focused on readable chaos, character identity, and modular progression.")
+      () => this.openStaticMenuPanel("SOBRE", "Roguelite survival top-down focado em caos legível, identidade forte de personagem e progressão modular.")
     );
     createMenuAction(
-      "SETTINGS",
+      "AJUSTES",
       564,
       0xdab181,
       () =>
         this.openStaticMenuPanel(
-          "SETTINGS",
-          "Audio unlocks on first input. Use TAB during the run for build stats. Multiplayer modes stay visible here but remain disabled in this milestone."
+          "AJUSTES",
+          "O áudio desbloqueia no primeiro input. Use TAB durante a run para abrir a build. Os modos multiplayer seguem visíveis, mas ainda estão desativados neste marco."
         )
     );
 
     const footer = this.add
-      .text(VIEW_WIDTH / 2, 642, "Only Play is active in this build. Choose a character to begin a single-player run.", {
+      .text(VIEW_WIDTH / 2, 642, "A run solo é o modo ativo neste build. Escolha um personagem para começar.", {
         fontFamily: "Trebuchet MS",
         fontSize: "18px",
         color: "#dce6de",
@@ -977,149 +1098,162 @@ export class GameScene extends Phaser.Scene {
     this.player.setVelocity(0, 0);
     this.clearOverlay();
     this.createModalFrame(
-      "Character Selection",
-      "Escolha a identidade da run. Cada personagem entra com passivas verdes e vermelhas, uma arma inicial fixa e um nivel de risco diferente."
+      "Escolha do Personagem",
+      "Monte sua run a partir de um perfil claro. Destaques em verde fortalecem a build; trade-offs em vermelho definem o risco."
     );
     this.activeChoiceActions = [];
+    this.characterEntries = [];
 
     const selectedCharacter = CHARACTERS[this.selectedCharacterId];
     const startingWeapon = WEAPONS[selectedCharacter.startingWeaponId];
     const rarity = WEAPON_RARITIES[startingWeapon.rarity];
+    const layout = this.getOverlayLayoutMetrics();
+    const panelCenterY = 294;
+    const panel = this.createOverlayPanel(VIEW_WIDTH / 2, panelCenterY, layout.width, 264, 0x111816, selectedCharacter.accent);
+    panel.setAlpha(0.97);
 
-    this.createOverlayPanel(382, 292, 220, 188, 0x101513, 0x5c6965);
-    this.createOverlayPanel(852, 300, 438, 336, selectedCharacter.panelTint, selectedCharacter.accent);
-
-    const runOptionsTitle = this.add
-      .text(382, 214, "RUN OPTIONS", {
+    const portraitPlate = this.add.rectangle(layout.left + 110, panelCenterY, 160, 170, 0x141d1a, 0.98).setStrokeStyle(2, selectedCharacter.accent, 0.94).setDepth(74);
+    const portraitSlot = this.add.rectangle(layout.left + 110, panelCenterY + 84, 126, 24, 0x0f1513, 0.92).setStrokeStyle(1, 0x5f726d, 0.45).setDepth(75);
+    const portraitSlotLabel = this.add
+      .text(layout.left + 110, panelCenterY + 84, "slot retrato", {
         fontFamily: "Trebuchet MS",
-        fontSize: "24px",
-        color: "#f8f6eb",
-        stroke: "#161b19",
-        strokeThickness: 4
-      })
-      .setOrigin(0.5)
-      .setDepth(74);
-    const runOptionsBody = this.add
-      .text(
-        382,
-        292,
-        ["Mode  Single Player", "Arena  Crash Zone", `Bosses  Every ${BOSS_PHASE_INTERVAL} phases`, "Weapon Drafts  Phase 5+"].join("\n\n"),
-        {
-          fontFamily: "Trebuchet MS",
-          fontSize: "19px",
-          color: "#dce6de",
-          align: "left",
-          stroke: "#161b19",
-          strokeThickness: 3
-        }
-      )
-      .setOrigin(0.5)
-      .setDepth(74);
-
-    const portraitPlate = this.add.rectangle(690, 300, 152, 206, 0x131a18, 0.94).setStrokeStyle(2, selectedCharacter.accent, 0.92).setDepth(74);
-    const portrait = this.add.image(690, 300, "player").setTint(selectedCharacter.portraitTint ?? selectedCharacter.accent).setScale(2.35).setDepth(75);
-    const title = this.add
-      .text(852, 176, selectedCharacter.label.toUpperCase(), {
-        fontFamily: "Trebuchet MS",
-        fontSize: "32px",
-        color: "#f8f6eb",
-        stroke: "#161b19",
-        strokeThickness: 4
-      })
-      .setOrigin(0.5, 0)
-      .setDepth(75);
-    const difficulty = this.add
-      .text(852, 216, `Difficulty  ${selectedCharacter.difficultyLabel}`, {
-        fontFamily: "Trebuchet MS",
-        fontSize: "18px",
-        color: "#dce6de",
-        stroke: "#161b19",
-        strokeThickness: 3
-      })
-      .setOrigin(0.5, 0)
-      .setDepth(75);
-    const weaponBadge = this.add.rectangle(852, 258, 286, 36, rarity.fill, 0.96).setStrokeStyle(2, rarity.border, 0.96).setDepth(75);
-    const weaponText = this.add
-      .text(852, 258, `${startingWeapon.label}  •  ${rarity.label}`, {
-        fontFamily: "Trebuchet MS",
-        fontSize: "18px",
-        color: "#f8f6eb",
-        stroke: "#161b19",
-        strokeThickness: 3
+        fontSize: "12px",
+        color: "#96a59f"
       })
       .setOrigin(0.5)
       .setDepth(76);
-    const summary = this.add
-      .text(852, 288, selectedCharacter.summary, {
+    const portrait = this.add.image(layout.left + 110, panelCenterY - 10, "player").setTint(selectedCharacter.portraitTint ?? selectedCharacter.accent).setScale(2.35).setDepth(75);
+    const title = this.add
+      .text(layout.left + 218, 182, selectedCharacter.label.toUpperCase(), {
         fontFamily: "Trebuchet MS",
-        fontSize: "17px",
-        color: "#dce6de",
-        align: "center",
-        wordWrap: { width: 360 },
+        fontSize: "34px",
+        color: "#f7f3e9",
+        stroke: "#161b19",
+        strokeThickness: 4
+      })
+      .setDepth(75);
+    const difficulty = this.add
+      .text(layout.left + 218, 224, `Dificuldade  ${selectedCharacter.difficultyLabel}`, {
+        fontFamily: "Trebuchet MS",
+        fontSize: "18px",
+        color: "#d6e2dc",
         stroke: "#161b19",
         strokeThickness: 3
       })
-      .setOrigin(0.5, 0)
+      .setDepth(75);
+    const weaponBadge = this.add.rectangle(layout.left + 218, 270, 278, 34, rarity.fill, 0.96).setOrigin(0, 0.5).setStrokeStyle(2, rarity.border, 0.96).setDepth(75);
+    const weaponText = this.add
+      .text(layout.left + 236, 270, `${startingWeapon.label} • ${rarity.label}`, {
+        fontFamily: "Trebuchet MS",
+        fontSize: "16px",
+        color: "#f8f6eb",
+        stroke: "#161b19",
+        strokeThickness: 3
+      })
+      .setOrigin(0, 0.5)
+      .setDepth(76);
+    const summary = this.add
+      .text(layout.left + 218, 298, selectedCharacter.summary, {
+        fontFamily: "Trebuchet MS",
+        fontSize: "18px",
+        color: "#d9e3dc",
+        stroke: "#161b19",
+        strokeThickness: 3,
+        wordWrap: { width: 380 }
+      })
+      .setDepth(75);
+    this.fitTextBlock(summary, 380, 42, 15);
+
+    const prosTitle = this.add
+      .text(layout.left + 218, 344, "Pontos Fortes", {
+        fontFamily: "Trebuchet MS",
+        fontSize: "16px",
+        color: "#8fe3a2",
+        stroke: "#161b19",
+        strokeThickness: 3
+      })
+      .setDepth(75);
+    const consTitle = this.add
+      .text(layout.left + 514, 344, "Pontos Fracos", {
+        fontFamily: "Trebuchet MS",
+        fontSize: "16px",
+        color: "#ff958b",
+        stroke: "#161b19",
+        strokeThickness: 3
+      })
       .setDepth(75);
     const pros = this.add
-      .text(748, 356, ["POSITIVE", ...selectedCharacter.pros.map((entry) => `+ ${entry}`)].join("\n"), {
+      .text(layout.left + 218, 368, selectedCharacter.pros.map((entry) => `+ ${entry}`).join("\n"), {
         fontFamily: "Trebuchet MS",
-        fontSize: "18px",
-        color: "#8fe3a2",
-        align: "left",
-        wordWrap: { width: 176 },
+        fontSize: "16px",
+        color: "#9ae7ac",
         stroke: "#161b19",
-        strokeThickness: 3
+        strokeThickness: 3,
+        wordWrap: { width: 244 }
       })
-      .setOrigin(0, 0)
       .setDepth(75);
     const cons = this.add
-      .text(924, 356, ["NEGATIVE", ...selectedCharacter.cons.map((entry) => `- ${entry}`)].join("\n"), {
+      .text(layout.left + 514, 368, selectedCharacter.cons.map((entry) => `- ${entry}`).join("\n"), {
+        fontFamily: "Trebuchet MS",
+        fontSize: "16px",
+        color: "#ffab9f",
+        stroke: "#161b19",
+        strokeThickness: 3,
+        wordWrap: { width: 212 }
+      })
+      .setDepth(75);
+    this.fitTextBlock(pros, 244, 42, 13);
+    this.fitTextBlock(cons, 212, 42, 13);
+    this.overlayElements.push(panel, portraitPlate, portraitSlot, portraitSlotLabel, portrait, title, difficulty, weaponBadge, weaponText, summary, prosTitle, consTitle, pros, cons);
+
+    const rosterLabel = this.add
+      .text(VIEW_WIDTH / 2, 474, "Elenco da Run", {
         fontFamily: "Trebuchet MS",
         fontSize: "18px",
-        color: "#ff958b",
-        align: "left",
-        wordWrap: { width: 176 },
+        color: "#dce8e1",
         stroke: "#161b19",
         strokeThickness: 3
       })
-      .setOrigin(0, 0)
+      .setOrigin(0.5)
       .setDepth(75);
-    this.overlayElements.push(runOptionsTitle, runOptionsBody, portraitPlate, portrait, title, difficulty, weaponBadge, weaponText, summary, pros, cons);
+    this.overlayElements.push(rosterLabel);
 
-    const columns = 4;
-    const spacingX = 102;
-    const spacingY = 76;
-    const startX = VIEW_WIDTH / 2 - ((columns - 1) * spacingX) / 2;
-    const startY = 518;
+    const rowCount = this.getResponsiveRowCount(CHARACTER_ORDER.length);
+    const columns = Math.ceil(CHARACTER_ORDER.length / rowCount);
+    this.characterGridColumns = columns;
+    this.characterFocusIndex = Math.max(0, CHARACTER_ORDER.indexOf(this.selectedCharacterId));
+    const cellWidth = 84;
+    const cellHeight = 86;
+    const startX = VIEW_WIDTH / 2 - ((columns - 1) * cellWidth) / 2;
+    const startY = 532 - ((rowCount - 1) * cellHeight) / 2;
+
     CHARACTER_ORDER.forEach((characterId, index) => {
-      const x = startX + (index % columns) * spacingX;
-      const y = startY + Math.floor(index / columns) * spacingY;
-      this.createCharacterIconButton(x, y, CHARACTERS[characterId], characterId === this.selectedCharacterId, () => {
+      const x = startX + (index % columns) * cellWidth;
+      const y = startY + Math.floor(index / columns) * cellHeight;
+      const entry = this.createCharacterIconButton(x, y, CHARACTERS[characterId], index === this.characterFocusIndex, () => {
+        this.overlayInputMode = "mouse";
         this.selectedCharacterId = characterId;
+        this.characterFocusIndex = index;
         this.openCharacterSelect();
       });
+      this.characterEntries.push(entry);
     });
+    this.applyOverlayFocus(this.characterEntries, this.characterFocusIndex);
 
     const footer = this.add
-      .text(
-        VIEW_WIDTH / 2,
-        678,
-        [`Weapon drafts arrive every 5 phases. Bosses arrive every ${BOSS_PHASE_INTERVAL} phases.`, `The selected character is saved locally under ${PROFILE_STORAGE_KEY}.`].join("\n"),
-        {
-          fontFamily: "Trebuchet MS",
-          fontSize: "16px",
-          color: "#dce6de",
-          align: "center",
-          stroke: "#161b19",
-          strokeThickness: 3
-        }
-      )
+      .text(VIEW_WIDTH / 2, 640, "Use WASD / setas para navegar. A selecao atual fica salva localmente.", {
+        fontFamily: "Trebuchet MS",
+        fontSize: "14px",
+        color: "#c7d4cd",
+        align: "center",
+        stroke: "#161b19",
+        strokeThickness: 2
+      })
       .setOrigin(0.5)
-      .setDepth(73);
+      .setDepth(75);
     this.overlayElements.push(footer);
-    this.createActionButton(VIEW_WIDTH / 2 - 170, 668, 220, 54, "BACK", 0x90a39c, () => this.openMainMenu());
-    this.createActionButton(VIEW_WIDTH / 2 + 170, 668, 260, 58, "START RUN", 0xc0d78f, () => this.startRun(this.selectedCharacterId));
+    this.createActionButton(VIEW_WIDTH / 2 - 128, 682, 184, 44, "Voltar", 0x90a39c, () => this.openMainMenu());
+    this.createActionButton(VIEW_WIDTH / 2 + 128, 682, 220, 48, "Iniciar Run", 0xc0d78f, () => this.startRun(this.selectedCharacterId));
   }
 
   private updatePlayerMovement(): void {
@@ -1161,20 +1295,27 @@ export class GameScene extends Phaser.Scene {
 
       orb.floatOffset += delta * 0.004;
       orb.setScale(1 + Math.sin(orb.floatOffset) * 0.08);
-      const toPlayer = new Phaser.Math.Vector2(this.player.x - orb.x, this.player.y - orb.y);
-      const distance = toPlayer.length();
-      const magnetRadius = XP_TOUCH_RADIUS + this.run.stats.xpMagnetRadius;
+      const dx = this.cachedPlayerX - orb.x;
+      const dy = this.cachedPlayerY - orb.y;
+      const distanceSq = dx * dx + dy * dy;
+      const activeOrbCount = this.run.xpOrbs.length;
+      const lateGameMagnetBonus = activeOrbCount > XP_HIGH_DENSITY_THRESHOLD ? Math.min(140, this.run.phase * 3 + activeOrbCount * 0.35) : 0;
+      const magnetRadius = XP_TOUCH_RADIUS + this.run.stats.xpMagnetRadius + lateGameMagnetBonus;
+      const magnetRadiusSq = magnetRadius * magnetRadius;
 
-      if (distance <= XP_TOUCH_RADIUS) {
+      if (distanceSq <= XP_TOUCH_RADIUS * XP_TOUCH_RADIUS) {
         this.collectXpOrb(orb);
         continue;
       }
 
-      if (distance <= magnetRadius && distance > 0.001) {
-        toPlayer.normalize().scale(120 + this.run.stats.xpMagnetRadius * 0.6);
-        this.getBody(orb).setVelocity(toPlayer.x, toPlayer.y);
-      } else {
-        this.getBody(orb).setVelocity(0, 0);
+      const body = this.getBody(orb);
+      if (distanceSq <= magnetRadiusSq && distanceSq > 0.001) {
+        const distance = Math.sqrt(distanceSq);
+        const speed = 120 + this.run.stats.xpMagnetRadius * 0.6 + lateGameMagnetBonus * 0.75;
+        const invDistance = 1 / distance;
+        body.setVelocity(dx * invDistance * speed, dy * invDistance * speed);
+      } else if (body.velocity.x !== 0 || body.velocity.y !== 0) {
+        body.setVelocity(0, 0);
       }
     }
   }
@@ -1187,7 +1328,7 @@ export class GameScene extends Phaser.Scene {
     const now = this.time.now;
     const value = orb.value;
     orb.disableBody(true, true);
-    this.run.xpOrbs = this.run.xpOrbs.filter((entry) => entry.id !== orb.orbId);
+    this.removeXpOrbState(orb.orbId);
     this.spawnParticleBurst(orb.x, orb.y, 4, 0x9ff7d2);
     this.audioController.pickup();
     this.awardXp(value, now);
@@ -1211,7 +1352,7 @@ export class GameScene extends Phaser.Scene {
     this.showBanner("LEVEL UP", 650, time);
 
     if (this.run.flowMode === "live") {
-      this.openItemDraft(time, true);
+      this.openItemDraftResponsive(time, true);
     }
   }
 
@@ -1220,7 +1361,7 @@ export class GameScene extends Phaser.Scene {
       return;
     }
 
-    const pendingNormals = this.run.pendingSpawns.filter((spawn) => spawn.enemyType !== "boss").length;
+    const pendingNormals = this.getPendingNormalSpawnCount();
     const activeNormals = this.getActiveNormalEnemyCount();
     const cap = getPhaseEnemyCap(this.run.phase);
     const stepped = stepSpawnAccumulator(this.run.spawnAccumulator, this.run.phase, delta);
@@ -1248,7 +1389,7 @@ export class GameScene extends Phaser.Scene {
       this.showBanner("BURST WAVE", 900, time);
       let burstBudget = Math.min(
         getBurstWaveCount(this.run.phase),
-        Math.max(0, cap - this.getActiveNormalEnemyCount() - this.run.pendingSpawns.filter((spawn) => spawn.enemyType !== "boss").length),
+        Math.max(0, cap - this.getActiveNormalEnemyCount() - this.getPendingNormalSpawnCount()),
         Math.max(0, MAX_PENDING_SPAWNS - this.run.pendingSpawns.length)
       );
 
@@ -1265,6 +1406,12 @@ export class GameScene extends Phaser.Scene {
   }
 
   private getSafeSpawnPoint(): { x: number; y: number } | null {
+    this.pendingSpawnPointsScratch.length = this.run.pendingSpawns.length;
+    for (let index = 0; index < this.run.pendingSpawns.length; index += 1) {
+      const spawn = this.run.pendingSpawns[index];
+      this.pendingSpawnPointsScratch[index] = { x: spawn.x, y: spawn.y };
+    }
+
     return (
       pickSpawnPoint(
         VIEW_WIDTH,
@@ -1272,8 +1419,8 @@ export class GameScene extends Phaser.Scene {
         SPAWN_POINT_MARGIN,
         SPAWN_SAFE_RADIUS,
         SPAWN_MARKER_SPACING,
-        { x: this.player.x, y: this.player.y },
-        this.run.pendingSpawns.map((spawn) => ({ x: spawn.x, y: spawn.y }))
+        { x: this.cachedPlayerX, y: this.cachedPlayerY },
+        this.pendingSpawnPointsScratch
       ) ?? this.getFallbackSpawnPoint()
     );
   }
@@ -1286,11 +1433,20 @@ export class GameScene extends Phaser.Scene {
       { x: VIEW_WIDTH - SPAWN_POINT_MARGIN, y: VIEW_HEIGHT - SPAWN_POINT_MARGIN }
     ];
 
-    return candidates.sort(
-      (a, b) =>
-        Phaser.Math.Distance.Between(b.x, b.y, this.player.x, this.player.y) -
-        Phaser.Math.Distance.Between(a.x, a.y, this.player.x, this.player.y)
-    )[0];
+    let best = candidates[0];
+    let bestDistanceSq = -1;
+
+    for (const candidate of candidates) {
+      const dx = candidate.x - this.cachedPlayerX;
+      const dy = candidate.y - this.cachedPlayerY;
+      const distanceSq = dx * dx + dy * dy;
+      if (distanceSq > bestDistanceSq) {
+        best = candidate;
+        bestDistanceSq = distanceSq;
+      }
+    }
+
+    return best;
   }
 
   private scheduleBossSpawn(time: number): void {
@@ -1327,33 +1483,40 @@ export class GameScene extends Phaser.Scene {
     marker.setScale(scale);
     marker.setTint(enemyType === "boss" ? BOSSES[bossId ?? "titan"].tint : enemyType === "elite" ? 0xff90b2 : 0xca3038);
     this.spawnMarkers.set(id, marker);
-    this.tweens.add({
-      targets: marker,
-      scaleX: scale * 1.12,
-      scaleY: scale * 1.12,
-      yoyo: true,
-      repeat: -1,
-      duration: 280
-    });
     this.run.pendingSpawns.push({ id, enemyType, bossId, x, y, createdAt: time, spawnAt: time + SPAWN_TELEGRAPH_MS });
   }
 
   private updatePendingSpawns(time: number): void {
-    for (const pending of this.run.pendingSpawns) {
+    let writeIndex = 0;
+
+    for (let index = 0; index < this.run.pendingSpawns.length; index += 1) {
+      const pending = this.run.pendingSpawns[index];
       const marker = this.spawnMarkers.get(pending.id);
       if (!marker) {
+        if (time < pending.spawnAt) {
+          this.run.pendingSpawns[writeIndex] = pending;
+          writeIndex += 1;
+        }
         continue;
       }
-      marker.setAlpha(0.42 + Math.sin((time - pending.createdAt) * 0.015) * 0.22);
+
+      const elapsed = time - pending.createdAt;
+      const baseScale = pending.enemyType === "boss" ? 1.4 : pending.enemyType === "elite" ? 1.15 : 1;
+      marker.setAlpha(0.42 + Math.sin(elapsed * 0.015) * 0.22);
+      marker.setScale(baseScale + Math.sin(elapsed * 0.018) * 0.08);
+
+      if (time >= pending.spawnAt) {
+        marker.destroy();
+        this.spawnMarkers.delete(pending.id);
+        this.spawnEnemy(pending.enemyType, pending.x, pending.y, time, pending.bossId);
+        continue;
+      }
+
+      this.run.pendingSpawns[writeIndex] = pending;
+      writeIndex += 1;
     }
 
-    const resolved = resolvePendingSpawns(this.run.pendingSpawns, time);
-    this.run.pendingSpawns = resolved.pending;
-    for (const spawn of resolved.ready) {
-      this.spawnMarkers.get(spawn.id)?.destroy();
-      this.spawnMarkers.delete(spawn.id);
-      this.spawnEnemy(spawn.enemyType, spawn.x, spawn.y, time, spawn.bossId);
-    }
+    this.run.pendingSpawns.length = writeIndex;
   }
 
   private spawnEnemy(enemyType: EnemyId, x: number, y: number, time: number, bossId?: BossId): void {
@@ -1363,11 +1526,16 @@ export class GameScene extends Phaser.Scene {
     const healthMultiplier = enemyType === "boss" ? getBossHealthMultiplier(this.run.phase) : getEnemyHealthMultiplier(this.run.phase);
     const speedMultiplier = getEnemySpeedMultiplier(this.run.phase);
     const texture = enemyType === "boss" && bossDef ? `enemy-boss-${bossDef.id}` : `enemy-${enemyType}`;
-    const enemy = this.physics.add.image(x, y, texture) as EnemySprite;
+    const enemy = this.enemies.get(x, y, texture) as EnemySprite | null;
+    if (!enemy) {
+      return;
+    }
+
     const baseHp = bossDef ? bossDef.baseHp : normalDef?.maxHp ?? 1;
     const attackCooldownMs = normalDef?.attackCooldownMs ?? 0;
     const hp = Math.max(1, Math.round(baseHp * healthMultiplier));
 
+    enemy.enableBody(true, x, y, true, true);
     enemy.uid = this.enemyUidCounter++;
     enemy.enemyType = enemyType;
     enemy.bossId = bossDef?.id;
@@ -1391,10 +1559,13 @@ export class GameScene extends Phaser.Scene {
     enemy.nextBurnTickAt = 0;
     enemy.poisonUntil = 0;
     enemy.nextPoisonTickAt = 0;
+    enemy.nextLogicAt = 0;
     enemy.setDepth(enemyType === "boss" ? 16 : 12).setTint(baseDef.tint).setScale(0.3).setAlpha(0.05);
+    enemy.setTexture(texture);
     enemy.setCircle(baseDef.radius, enemy.width / 2 - baseDef.radius, enemy.height / 2 - baseDef.radius);
-    this.getBody(enemy).setAllowGravity(false);
-    this.enemies.add(enemy);
+    const body = this.getBody(enemy);
+    body.setAllowGravity(false);
+    body.setVelocity(0, 0);
     this.tweens.add({
       targets: enemy,
       scaleX: 1,
@@ -1404,6 +1575,7 @@ export class GameScene extends Phaser.Scene {
       ease: "Back.Out"
     });
     this.spawnParticleBurst(x, y, enemyType === "boss" ? 10 : 5, enemyType === "boss" ? bossDef?.deathTint ?? 0xffd9d9 : baseDef.deathTint);
+    this.cachedNearestEnemy = null;
   }
 
   private updateEnemies(time: number): void {
@@ -1425,10 +1597,27 @@ export class GameScene extends Phaser.Scene {
         continue;
       }
 
-      const toPlayer = new Phaser.Math.Vector2(this.player.x - enemy.x, this.player.y - enemy.y);
-      if (toPlayer.lengthSq() > 0.0001) {
-        toPlayer.normalize().scale(enemy.moveSpeed);
-        this.getBody(enemy).setVelocity(toPlayer.x, toPlayer.y);
+      const dx = this.cachedPlayerX - enemy.x;
+      const dy = this.cachedPlayerY - enemy.y;
+      const distanceSq = dx * dx + dy * dy;
+
+      if (distanceSq > ENEMY_MID_DISTANCE * ENEMY_MID_DISTANCE) {
+        if (time < enemy.nextLogicAt) {
+          continue;
+        }
+        enemy.nextLogicAt = time + ENEMY_FAR_UPDATE_INTERVAL_MS;
+      } else if (distanceSq > ENEMY_NEAR_DISTANCE * ENEMY_NEAR_DISTANCE) {
+        if (time < enemy.nextLogicAt) {
+          continue;
+        }
+        enemy.nextLogicAt = time + ENEMY_MID_UPDATE_INTERVAL_MS;
+      } else {
+        enemy.nextLogicAt = 0;
+      }
+
+      if (distanceSq > 0.0001) {
+        const invDistance = enemy.moveSpeed / Math.sqrt(distanceSq);
+        this.getBody(enemy).setVelocity(dx * invDistance, dy * invDistance);
       }
 
       if (enemy.enemyType === "shooter") {
@@ -1464,10 +1653,12 @@ export class GameScene extends Phaser.Scene {
   private updateBossMovement(boss: EnemySprite, time: number): void {
     const bossDef = boss.bossId ? BOSSES[boss.bossId] : BOSSES.titan;
     if (time < boss.chargeUntil) {
-      const chargeVector = new Phaser.Math.Vector2(this.player.x - boss.x, this.player.y - boss.y);
-      if (chargeVector.lengthSq() > 0.001) {
-        chargeVector.normalize().scale(boss.moveSpeed * (bossDef.id === "ironColossus" ? 2.7 : 2.25));
-        this.getBody(boss).setVelocity(chargeVector.x, chargeVector.y);
+      const chargeDx = this.cachedPlayerX - boss.x;
+      const chargeDy = this.cachedPlayerY - boss.y;
+      const chargeDistanceSq = chargeDx * chargeDx + chargeDy * chargeDy;
+      if (chargeDistanceSq > 0.001) {
+        const chargeSpeed = boss.moveSpeed * (bossDef.id === "ironColossus" ? 2.7 : 2.25) / Math.sqrt(chargeDistanceSq);
+        this.getBody(boss).setVelocity(chargeDx * chargeSpeed, chargeDy * chargeSpeed);
       }
       return;
     }
@@ -1478,20 +1669,28 @@ export class GameScene extends Phaser.Scene {
       boss.nextMoveSwitchAt = time + (boss.bossStrafing ? 1_150 : 1_850);
     }
 
-    const toPlayer = new Phaser.Math.Vector2(this.player.x - boss.x, this.player.y - boss.y);
-    if (toPlayer.lengthSq() <= 0.0001) {
+    const dx = this.cachedPlayerX - boss.x;
+    const dy = this.cachedPlayerY - boss.y;
+    const distanceSq = dx * dx + dy * dy;
+    if (distanceSq <= 0.0001) {
       return;
     }
 
-    toPlayer.normalize();
+    const invDistance = 1 / Math.sqrt(distanceSq);
+    const nx = dx * invDistance;
+    const ny = dy * invDistance;
     if (!boss.bossStrafing) {
-      this.getBody(boss).setVelocity(toPlayer.x * boss.moveSpeed, toPlayer.y * boss.moveSpeed);
+      this.getBody(boss).setVelocity(nx * boss.moveSpeed, ny * boss.moveSpeed);
       return;
     }
 
-    const strafe = toPlayer.clone().rotate((boss.strafeDirection * Math.PI) / 2).scale(boss.moveSpeed * 0.82);
-    const chase = toPlayer.clone().scale(boss.moveSpeed * 0.28);
-    this.getBody(boss).setVelocity(strafe.x + chase.x, strafe.y + chase.y);
+    const strafeScale = boss.moveSpeed * 0.82;
+    const chaseScale = boss.moveSpeed * 0.28;
+    const strafeX = -ny * boss.strafeDirection * strafeScale;
+    const strafeY = nx * boss.strafeDirection * strafeScale;
+    const chaseX = nx * chaseScale;
+    const chaseY = ny * chaseScale;
+    this.getBody(boss).setVelocity(strafeX + chaseX, strafeY + chaseY);
   }
 
   private updateShooterAttack(enemy: EnemySprite, time: number): void {
@@ -1575,7 +1774,7 @@ export class GameScene extends Phaser.Scene {
     bullet.lastHitEnemyUid = -1;
     bullet.lastHitTime = 0;
     bullet.trailTint = kind === "slow" ? 0xf7b27f : 0xf5e58d;
-    bullet.nextTrailAt = this.time.now + 45;
+    bullet.nextTrailAt = this.time.now + PROJECTILE_TRAIL_INTERVAL_MS;
     bullet.weaponId = undefined;
     bullet.explosiveRadius = 0;
     bullet.explosiveDamage = 0;
@@ -1906,7 +2105,7 @@ export class GameScene extends Phaser.Scene {
     bullet.lastHitEnemyUid = -1;
     bullet.lastHitTime = 0;
     bullet.trailTint = options.tint;
-    bullet.nextTrailAt = options.speed <= 0.1 ? Number.POSITIVE_INFINITY : this.time.now + 45;
+    bullet.nextTrailAt = options.speed <= 0.1 ? Number.POSITIVE_INFINITY : this.time.now + PROJECTILE_TRAIL_INTERVAL_MS;
   }
 
   private fireBeamWeapon(originX: number, originY: number, angle: number, weapon: WeaponDef): void {
@@ -1914,6 +2113,9 @@ export class GameScene extends Phaser.Scene {
     const beamWidth = weapon.behaviorConfig.beamWidth ?? 18;
     const endX = originX + Math.cos(angle) * beamLength;
     const endY = originY + Math.sin(angle) * beamLength;
+    const lineDx = endX - originX;
+    const lineDy = endY - originY;
+    const lineLengthSq = lineDx * lineDx + lineDy * lineDy || 1;
     const beam = this.add.graphics().setDepth(17);
     beam.lineStyle(beamWidth * 0.28, weapon.tint, 0.86);
     beam.beginPath();
@@ -1932,10 +2134,12 @@ export class GameScene extends Phaser.Scene {
         continue;
       }
 
-      const distanceToLine = Phaser.Math.Distance.BetweenPoints(
-        new Phaser.Math.Vector2(enemy.x, enemy.y),
-        Phaser.Geom.Line.GetNearestPoint(new Phaser.Geom.Line(originX, originY, endX, endY), new Phaser.Math.Vector2(enemy.x, enemy.y))
-      );
+      const t = Phaser.Math.Clamp(((enemy.x - originX) * lineDx + (enemy.y - originY) * lineDy) / lineLengthSq, 0, 1);
+      const nearestX = originX + lineDx * t;
+      const nearestY = originY + lineDy * t;
+      const nearestDx = enemy.x - nearestX;
+      const nearestDy = enemy.y - nearestY;
+      const distanceToLine = Math.sqrt(nearestDx * nearestDx + nearestDy * nearestDy);
 
       if (distanceToLine > beamWidth + enemy.radiusValue) {
         continue;
@@ -2033,19 +2237,16 @@ export class GameScene extends Phaser.Scene {
     const extraTargets = Math.max(2, weapon.behaviorConfig.chainTargets ?? 3);
     const damageMultiplier = weapon.behaviorConfig.chainDamageMultiplier ?? 0.65;
     const chainRange = weapon.behaviorConfig.chainRange ?? CHAIN_LIGHTNING_RANGE;
-    const nearby = (this.enemies.getChildren() as EnemySprite[])
-      .filter((enemy) => enemy.active && enemy.uid !== nearest.uid)
-      .map((enemy) => ({ enemy, distance: Phaser.Math.Distance.Between(enemy.x, enemy.y, nearest.x, nearest.y) }))
-      .filter((entry) => entry.distance <= chainRange)
-      .sort((a, b) => a.distance - b.distance)
-      .slice(0, extraTargets);
+    this.enemyGrid.queryRadius(nearest.x, nearest.y, chainRange, this.nearbyEnemiesScratch, nearest.uid);
+    this.sortEnemiesByDistance(this.nearbyEnemiesScratch, nearest.x, nearest.y);
 
-    nearby.forEach(({ enemy }) => {
+    for (let index = 0; index < Math.min(extraTargets, this.nearbyEnemiesScratch.length); index += 1) {
+      const enemy = this.nearbyEnemiesScratch[index];
       this.spawnLightningTrace(nearest.x, nearest.y, enemy.x, enemy.y, weapon.tint);
       this.damageEnemy(enemy, weapon.damage * this.run.stats.damageMultiplier * damageMultiplier, 0, 0, 0, {
         allowChain: false
       });
-    });
+    }
   }
 
   private updateProjectiles(time: number): void {
@@ -2062,22 +2263,26 @@ export class GameScene extends Phaser.Scene {
           bullet.y > VIEW_HEIGHT + PLAYER_BULLET_OFFSCREEN_MARGIN;
 
         if (time >= bullet.nextTrailAt) {
-          bullet.nextTrailAt = time + 45;
-          const trail = this.add
-            .image(bullet.x, bullet.y, "particle-dot")
-            .setTint(bullet.trailTint)
-            .setScale(bullet.owner === "player" ? 0.65 : 0.5)
-            .setAlpha(0.35)
-            .setDepth(10);
-          this.tweens.add({
-            targets: trail,
-            alpha: 0,
-            scaleX: trail.scaleX * 0.45,
-            scaleY: trail.scaleY * 0.45,
-            duration: 150,
-          onComplete: () => trail.destroy()
-        });
-      }
+          bullet.nextTrailAt = time + PROJECTILE_TRAIL_INTERVAL_MS;
+          const shouldSkipTrail =
+            this.activeTrailCount >= MAX_SIMULTANEOUS_TRAILS ||
+            bullet.expiresAt - time < 100 ||
+            outside ||
+            bullet.mineArmedAt > time;
+
+          if (!shouldSkipTrail) {
+            this.spawnImageEffect(this.trailEffects, FX_TRAIL_POOL_SIZE, "particle-dot", {
+              x: bullet.x,
+              y: bullet.y,
+              depth: 10,
+              tint: bullet.trailTint,
+              scale: bullet.owner === "player" ? 0.65 : 0.5,
+              alpha: 0.35,
+              durationMs: 150,
+              endScale: (bullet.owner === "player" ? 0.65 : 0.5) * 0.3
+            });
+          }
+        }
 
         if (bullet.owner === "player" && bullet.returnsAt > 0 && time >= bullet.returnsAt) {
           const body = this.getBody(bullet);
@@ -2212,12 +2417,12 @@ export class GameScene extends Phaser.Scene {
 
       if (nextReward.type === "itemDraft") {
         this.run.pendingItemChoices += 1;
-        this.openItemDraft(time, false);
+        this.openItemDraftResponsive(time, false);
         return;
       }
 
     if (nextReward.type === "weaponDraft") {
-      this.openWeaponDraft(nextReward.phase);
+      this.openWeaponDraftResponsive(nextReward.phase);
       return;
     }
 
@@ -2397,7 +2602,7 @@ export class GameScene extends Phaser.Scene {
     this.clearOverlay();
 
     if (this.run.pendingItemChoices > 0) {
-      this.openItemDraft(this.time.now, false);
+      this.openItemDraftResponsive(this.time.now, false);
       return;
     }
 
@@ -2583,13 +2788,275 @@ export class GameScene extends Phaser.Scene {
 
   private toggleStatsPanel(): void {
     if (this.run.flowMode === "live") {
-      this.openStatsPanel();
+      this.openStatsPanelResponsive();
       return;
     }
 
     if (this.run.flowMode === "statsPanel") {
       this.closeStatsPanel();
     }
+  }
+
+  private openItemDraftResponsive(time: number, fromLive: boolean): void {
+    if (fromLive) {
+      this.beginLivePause(time);
+    }
+
+    const choices = drawItemChoices(
+      buildItemOfferContext({
+        phase: this.run.phase,
+        level: this.run.level,
+        characterId: this.selectedCharacterId,
+        items: this.run.selectedItems,
+        equippedWeapons: this.run.equippedWeapons,
+        stats: this.run.stats
+      })
+    ).slice(0, ITEM_CARD_COUNT);
+
+    if (choices.length === 0) {
+      if (this.livePauseStartedAt !== null) {
+        this.resumeFromLivePause(time);
+      } else {
+        this.resolveQueuedRewards(time);
+      }
+      return;
+    }
+
+    this.run.currentItemOffer = choices;
+    this.run.flowMode = "itemDraft";
+    this.clearOverlay();
+    this.createModalFrame("Escolha de Item", "Escolha 1 item. Bônus aparecem em verde, trade-offs em vermelho e entram na build imediatamente.");
+    this.draftEntries = [];
+    this.activeChoiceActions = choices.map((choice) => () => this.selectItemChoice(choice));
+    this.draftFocusIndex = 0;
+
+    choices.forEach((choice, index) => {
+      const definition = ITEM_BY_ID[choice.itemId];
+      const rarity = ITEM_RARITIES[choice.rarity];
+      const synergies = definition.synergyHint
+        ? [definition.synergyHint]
+        : definition.possibleSynergies.map((synergyId) => SYNERGY_BY_ID[synergyId].label).slice(0, 2);
+      const card = this.createDraftCard({
+        x: VIEW_WIDTH / 2 + (index - 1) * 320,
+        y: VIEW_HEIGHT / 2 + 34,
+        width: 290,
+        height: 378,
+        title: definition.label,
+        summary: definition.shortDescription ?? definition.description,
+        accent: rarity.accent,
+        hotkeyIndex: index,
+        onSelect: () => this.selectItemChoice(choice),
+        onHover: () => {
+          this.overlayInputMode = "mouse";
+          this.draftFocusIndex = index;
+          this.applyOverlayFocus(this.draftEntries, index);
+        },
+        iconKey: definition.displayIconKey ?? `upgrade-${definition.category}`,
+        fillColor: rarity.fill,
+        rarityLabel: rarity.label.toUpperCase(),
+        categoryLabel: `${this.formatDraftProfile(choice.profile)} • ${this.formatItemCategory(definition.category)}`,
+        tags: definition.tags.slice(0, 4).map((tag) => String(tag)),
+        synergies,
+        pros: definition.pros,
+        cons: definition.cons,
+        footerLabel: `Pressione ${index + 1}, Enter ou clique`
+      });
+      this.draftEntries.push(card);
+      this.animateCardIn(card, index);
+    });
+
+    this.applyOverlayFocus(this.draftEntries, this.draftFocusIndex);
+  }
+
+  private openWeaponDraftResponsive(phase: number): void {
+    const choices = drawWeaponChoices(
+      phase,
+      this.run.equippedWeapons.map((weapon) => weapon.weaponId),
+      WEAPON_DRAFT_CARD_COUNT
+    );
+    this.run.weaponDraftOffer = { phase, choices };
+    this.run.flowMode = "weaponDraft";
+    this.clearOverlay();
+    this.createModalFrame("Nova Arma", `Fase ${phase}. Escolha uma nova arma para somar mais um slot de disparo independente.`);
+    this.draftEntries = [];
+    this.activeChoiceActions = choices.map((weaponId) => () => this.selectWeapon(weaponId));
+    this.draftFocusIndex = 0;
+
+    choices.forEach((weaponId, index) => {
+      const weapon = WEAPONS[weaponId];
+      const rarity = WEAPON_RARITIES[weapon.rarity];
+      const card = this.createDraftCard({
+        x: VIEW_WIDTH / 2 + (index - 1) * 308,
+        y: VIEW_HEIGHT / 2 + 28,
+        width: 274,
+        height: 344,
+        title: weapon.label,
+        summary: weapon.description,
+        accent: rarity.accent,
+        hotkeyIndex: index,
+        onSelect: () => this.selectWeapon(weaponId),
+        onHover: () => {
+          this.overlayInputMode = "mouse";
+          this.draftFocusIndex = index;
+          this.applyOverlayFocus(this.draftEntries, index);
+        },
+        iconKey: weapon.iconKey,
+        fillColor: rarity.fill,
+        rarityLabel: rarity.label.toUpperCase(),
+        categoryLabel: `${weapon.family.toUpperCase()} • Tier ${weapon.tier}`,
+        tags: weapon.tags.map((tag) => tag.toUpperCase()),
+        synergies: [`Comportamento: ${weapon.behaviorKind}`],
+        footerLabel: `Pressione ${index + 1}, Enter ou clique`
+      });
+      this.createWeaponPreview(card, weapon);
+      this.draftEntries.push(card);
+      this.animateCardIn(card, index);
+    });
+
+    this.applyOverlayFocus(this.draftEntries, this.draftFocusIndex);
+  }
+
+  private openStatsPanelResponsive(): void {
+    if (this.run.flowMode !== "live") {
+      return;
+    }
+
+    this.beginLivePause(this.time.now);
+    this.run.flowMode = "statsPanel";
+    this.refreshBuildSnapshot();
+    this.clearOverlay();
+    this.createModalFrame("Build da Run", "Leia os totais no topo e navegue pelas miniaturas para ver detalhes de itens e passivas.");
+
+    const snapshot = this.run.buildSnapshot;
+    this.renderStatGroupPanel(230, 286, 288, 212, "Ofensiva", 0xf3d38b, snapshot.offenseLines);
+    this.renderStatGroupPanel(552, 286, 288, 212, "Defesa", 0x98d6ad, snapshot.defenseLines);
+    this.renderStatGroupPanel(874, 286, 328, 212, "Utilidade + Build", 0x9dc4ff, snapshot.utilityLines);
+
+    const uniqueItemsText = this.add
+      .text(716, 402, `Itens unicos  ${snapshot.uniqueItemLabels.join(", ") || "nenhum"}`, {
+        fontFamily: "Trebuchet MS",
+        fontSize: "12px",
+        color: "#d8e3ff",
+        wordWrap: { width: 298 }
+      })
+      .setDepth(75);
+    const uniquePassivesText = this.add
+      .text(716, 422, `Passivas unicas  ${snapshot.uniquePassiveLabels.join(", ") || "nenhuma"}`, {
+        fontFamily: "Trebuchet MS",
+        fontSize: "12px",
+        color: "#dce7dd",
+        wordWrap: { width: 298 }
+      })
+      .setDepth(75);
+    const synergyText = this.add
+      .text(716, 442, `Sinergias ativas  ${snapshot.synergyLabels.join(", ") || "nenhuma"}`, {
+        fontFamily: "Trebuchet MS",
+        fontSize: "12px",
+        color: "#d9e7e2",
+        wordWrap: { width: 298 }
+      })
+      .setDepth(75);
+    this.fitTextBlock(uniqueItemsText, 298, 18, 10);
+    this.fitTextBlock(uniquePassivesText, 298, 18, 10);
+    this.fitTextBlock(synergyText, 298, 18, 10);
+    this.overlayElements.push(uniqueItemsText, uniquePassivesText, synergyText);
+
+    const inventoryPanel = this.createOverlayPanel(340, 558, 476, 248, 0x111816, 0x6d9ab0);
+    const detailPanel = this.createOverlayPanel(930, 558, 300, 248, 0x111816, 0x9bbca7);
+    inventoryPanel.setAlpha(0.98);
+    detailPanel.setAlpha(0.98);
+    const inventoryLabel = this.add
+      .text(114, 468, "Miniaturas da Build", {
+        fontFamily: "Trebuchet MS",
+        fontSize: "16px",
+        color: "#f8f6eb",
+        stroke: "#161b19",
+        strokeThickness: 3
+      })
+      .setDepth(75);
+    const detailLabel = this.add
+      .text(790, 468, "Detalhes do Foco", {
+        fontFamily: "Trebuchet MS",
+        fontSize: "16px",
+        color: "#f8f6eb",
+        stroke: "#161b19",
+        strokeThickness: 3
+      })
+      .setDepth(75);
+    this.overlayElements.push(inventoryLabel, detailLabel);
+
+    this.statsDetailTitle = this.add.text(790, 486, "", {
+      fontFamily: "Trebuchet MS",
+      fontSize: "22px",
+      color: "#f8f6eb",
+      stroke: "#161b19",
+      strokeThickness: 3,
+      wordWrap: { width: 254 }
+    }).setDepth(75);
+    this.statsDetailMeta = this.add.text(790, 524, "", {
+      fontFamily: "Trebuchet MS",
+      fontSize: "13px",
+      color: "#d7e3dc",
+      wordWrap: { width: 254 }
+    }).setDepth(75);
+    this.statsDetailDescription = this.add.text(790, 560, "", {
+      fontFamily: "Trebuchet MS",
+      fontSize: "13px",
+      color: "#c5d4cc",
+      wordWrap: { width: 254 }
+    }).setDepth(75);
+    this.statsDetailPros = this.add.text(790, 604, "", {
+      fontFamily: "Trebuchet MS",
+      fontSize: "12px",
+      color: "#9ae7ac",
+      wordWrap: { width: 254 }
+    }).setDepth(75);
+    this.statsDetailCons = this.add.text(790, 642, "", {
+      fontFamily: "Trebuchet MS",
+      fontSize: "12px",
+      color: "#ffab9f",
+      wordWrap: { width: 254 }
+    }).setDepth(75);
+    this.statsDetailFooter = this.add.text(790, 676, "", {
+      fontFamily: "Trebuchet MS",
+      fontSize: "11px",
+      color: "#d3ddd8",
+      wordWrap: { width: 254 }
+    }).setDepth(75);
+    this.overlayElements.push(
+      this.statsDetailTitle,
+      this.statsDetailMeta,
+      this.statsDetailDescription,
+      this.statsDetailPros,
+      this.statsDetailCons,
+      this.statsDetailFooter
+    );
+
+    this.statsEntries = [];
+    this.statsFocusIndex = 0;
+    this.statsGridColumns = Math.min(5, Math.max(3, Math.ceil(snapshot.inventoryEntries.length / 2)));
+    const chipSpacingX = 82;
+    const chipSpacingY = 84;
+    const chipStartX = 156;
+    const chipStartY = 506;
+    snapshot.inventoryEntries.forEach((entry, index) => {
+      const chip = this.createStatsInventoryChip(
+        entry,
+        chipStartX + (index % this.statsGridColumns) * chipSpacingX,
+        chipStartY + Math.floor(index / this.statsGridColumns) * chipSpacingY,
+        () => {
+          this.overlayInputMode = "mouse";
+          this.statsFocusIndex = index;
+          this.applyOverlayFocus(this.statsEntries, index);
+          this.updateStatsDetailPanel(entry);
+        }
+      );
+      this.statsEntries.push(chip);
+    });
+
+    this.applyOverlayFocus(this.statsEntries, this.statsFocusIndex);
+    this.updateStatsDetailPanel(snapshot.inventoryEntries[this.statsFocusIndex]);
+    this.createActionButton(VIEW_WIDTH / 2, 690, 210, 42, "Fechar", 0x8fb2b8, () => this.closeStatsPanel());
   }
 
   private handlePlayerBulletHit(bullet: BulletSprite, enemy: EnemySprite): void {
@@ -2680,7 +3147,10 @@ export class GameScene extends Phaser.Scene {
     enemy.flashUntil = this.time.now + 70;
     this.audioController.hit();
     this.cameras.main.shake(36, enemy.enemyType === "boss" ? 0.0016 : 0.00075);
-    this.spawnParticleBurst(enemy.x, enemy.y, enemy.enemyType === "boss" ? 8 : 4, config.crit ? 0xffe28c : enemy.deathTint);
+    if (this.time.now - this.lastImpactBurstAt >= IMPACT_EFFECT_THROTTLE_MS) {
+      this.lastImpactBurstAt = this.time.now;
+      this.spawnParticleBurst(enemy.x, enemy.y, enemy.enemyType === "boss" ? 8 : 4, config.crit ? 0xffe28c : enemy.deathTint);
+    }
 
     if (knockback > 0) {
       const direction = new Phaser.Math.Vector2(vx, vy);
@@ -2733,23 +3203,22 @@ export class GameScene extends Phaser.Scene {
 
     const deathX = enemy.x;
     const deathY = enemy.y;
-    const ghost = this.add
-      .image(deathX, deathY, enemy.enemyType === "boss" ? "enemy-boss" : `enemy-${enemy.enemyType}`)
-      .setTintFill(0xffffff)
-      .setDepth(17)
-      .setScale(enemy.scaleX);
-    this.tweens.add({
-      targets: ghost,
-      alpha: 0,
-      scaleX: ghost.scaleX * 1.2,
-      scaleY: ghost.scaleY * 1.2,
-      duration: 140,
-      onComplete: () => ghost.destroy()
+    this.spawnImageEffect(this.ghostEffects, FX_GHOST_POOL_SIZE, enemy.enemyType === "boss" ? `enemy-boss-${enemy.bossId ?? "titan"}` : `enemy-${enemy.enemyType}`, {
+      x: deathX,
+      y: deathY,
+      depth: 17,
+      tintFill: 0xffffff,
+      scale: enemy.scaleX,
+      alpha: 0.95,
+      durationMs: 140,
+      endScale: enemy.scaleX * 1.2
     });
     this.spawnParticleBurst(deathX, deathY, enemy.enemyType === "boss" ? 16 : 8, enemy.deathTint);
     enemy.disableBody(true, true);
+    this.getBody(enemy).setVelocity(0, 0);
     this.run.kills += 1;
     this.spawnXpDrops(enemy);
+    this.cachedNearestEnemy = null;
 
     if (allowExplosion && this.run.stats.explosionRadius > 0 && this.run.stats.explosionDamage > 0) {
       this.triggerExplosionOnKill(deathX, deathY, enemy.uid);
@@ -2780,8 +3249,23 @@ export class GameScene extends Phaser.Scene {
   }
 
   private spawnXpOrb(x: number, y: number, value: number): void {
+    const mergeRadius = this.run.xpOrbs.length >= XP_HIGH_DENSITY_THRESHOLD ? XP_HIGH_DENSITY_MERGE_RADIUS : XP_BASE_MERGE_RADIUS;
+    const forceMerge = this.run.xpOrbs.length >= XP_FORCE_MERGE_THRESHOLD;
+    const mergeTarget = this.findMergeableXpOrb(x, y, forceMerge ? XP_HIGH_DENSITY_MERGE_RADIUS : mergeRadius);
+
+    if (mergeTarget) {
+      mergeTarget.value += value;
+      mergeTarget.setScale(Math.min(1.3, mergeTarget.scaleX + 0.05));
+      mergeTarget.floatOffset += 0.5;
+      return;
+    }
+
     const orb = this.xpOrbs.get(x, y, "xp-orb") as XpOrbSprite | null;
     if (!orb) {
+      const fallbackTarget = this.findNearestXpOrb(x, y);
+      if (fallbackTarget) {
+        fallbackTarget.value += value;
+      }
       return;
     }
     const orbId = this.orbIdCounter++;
@@ -2893,16 +3377,8 @@ export class GameScene extends Phaser.Scene {
   }
 
   private damageEnemiesInRadius(x: number, y: number, radius: number, damage: number, source?: BulletSprite): void {
-    for (const enemy of this.enemies.getChildren() as EnemySprite[]) {
-      if (!enemy.active) {
-        continue;
-      }
-
-      const distance = Phaser.Math.Distance.Between(enemy.x, enemy.y, x, y);
-      if (distance > radius) {
-        continue;
-      }
-
+    this.enemyGrid.queryRadius(x, y, radius, this.nearbyEnemiesScratch);
+    for (const enemy of this.nearbyEnemiesScratch) {
       this.damageEnemy(enemy, damage, enemy.x - x, enemy.y - y, 24, {
         applyStatus: true,
         allowLifeSteal: false,
@@ -2919,13 +3395,9 @@ export class GameScene extends Phaser.Scene {
       return false;
     }
 
-    const candidates = (this.enemies.getChildren() as EnemySprite[])
-      .filter((enemy) => enemy.active && enemy.uid !== fromEnemy.uid)
-      .map((enemy) => ({ enemy, distance: Phaser.Math.Distance.Between(enemy.x, enemy.y, fromEnemy.x, fromEnemy.y) }))
-      .filter((entry) => entry.distance <= PROJECTILE_BOUNCE_RANGE)
-      .sort((a, b) => a.distance - b.distance);
-
-    const target = candidates[0]?.enemy;
+    this.enemyGrid.queryRadius(fromEnemy.x, fromEnemy.y, PROJECTILE_BOUNCE_RANGE, this.nearbyEnemiesScratch, fromEnemy.uid);
+    this.sortEnemiesByDistance(this.nearbyEnemiesScratch, fromEnemy.x, fromEnemy.y);
+    const target = this.nearbyEnemiesScratch[0];
     if (!target) {
       return false;
     }
@@ -2947,14 +3419,8 @@ export class GameScene extends Phaser.Scene {
   private triggerExplosionOnKill(x: number, y: number, sourceUid: number): void {
     this.spawnParticleBurst(x, y, 12, 0xffb263);
     this.cameras.main.shake(70, 0.0014);
-    for (const enemy of this.enemies.getChildren() as EnemySprite[]) {
-      if (!enemy.active || enemy.uid === sourceUid) {
-        continue;
-      }
-      const distance = Phaser.Math.Distance.Between(enemy.x, enemy.y, x, y);
-      if (distance > this.run.stats.explosionRadius) {
-        continue;
-      }
+    this.enemyGrid.queryRadius(x, y, this.run.stats.explosionRadius, this.nearbyEnemiesScratch, sourceUid);
+    for (const enemy of this.nearbyEnemiesScratch) {
       this.damageEnemy(enemy, this.run.stats.explosionDamage, enemy.x - x, enemy.y - y, 24, {
         applyStatus: false,
         allowLifeSteal: false,
@@ -2969,15 +3435,12 @@ export class GameScene extends Phaser.Scene {
   private triggerChainLightning(sourceEnemy: EnemySprite, baseDamage: number, time: number): void {
     const bonusTargets = this.run.activeSynergyIds.includes("critStorm") ? 1 : 0;
     const bonusDamage = this.run.activeSynergyIds.includes("critStorm") ? 0.2 : 0;
-    const targets = (this.enemies.getChildren() as EnemySprite[])
-      .filter((enemy) => enemy.active && enemy.uid !== sourceEnemy.uid)
-      .map((enemy) => ({ enemy, distance: Phaser.Math.Distance.Between(enemy.x, enemy.y, sourceEnemy.x, sourceEnemy.y) }))
-      .filter((entry) => entry.distance <= CHAIN_LIGHTNING_RANGE)
-      .sort((a, b) => a.distance - b.distance)
-      .slice(0, Math.max(0, Math.floor(this.run.stats.chainLightningTargets + bonusTargets)))
-      .map((entry) => entry.enemy);
+    this.enemyGrid.queryRadius(sourceEnemy.x, sourceEnemy.y, CHAIN_LIGHTNING_RANGE, this.nearbyEnemiesScratch, sourceEnemy.uid);
+    this.sortEnemiesByDistance(this.nearbyEnemiesScratch, sourceEnemy.x, sourceEnemy.y);
+    const targetCount = Math.max(0, Math.floor(this.run.stats.chainLightningTargets + bonusTargets));
 
-    for (const target of targets) {
+    for (let index = 0; index < Math.min(targetCount, this.nearbyEnemiesScratch.length); index += 1) {
+      const target = this.nearbyEnemiesScratch[index];
       this.spawnLightningTrace(sourceEnemy.x, sourceEnemy.y, target.x, target.y, 0x94ecff);
       this.damageEnemy(target, baseDamage * (this.run.stats.chainLightningDamageMultiplier + bonusDamage), 0, 0, 0, {
         applyStatus: false,
@@ -3117,40 +3580,59 @@ export class GameScene extends Phaser.Scene {
   }
 
   private updateHazards(time: number): void {
-    this.hazards = this.hazards.filter((hazard) => {
+    let writeIndex = 0;
+
+    for (let index = 0; index < this.hazards.length; index += 1) {
+      const hazard = this.hazards[index];
       if (time >= hazard.expiresAt) {
         hazard.gfx.destroy();
-        return false;
+        continue;
       }
 
       if (hazard.kind === "pool" || hazard.kind === "slowField") {
         hazard.gfx.setAlpha(0.16 + Math.sin(time * 0.01 + hazard.id) * 0.08);
-        const distance = Phaser.Math.Distance.Between(hazard.x, hazard.y, this.player.x, this.player.y);
-        if (hazard.kind === "slowField" && distance <= hazard.radius) {
+        const dx = this.cachedPlayerX - hazard.x;
+        const dy = this.cachedPlayerY - hazard.y;
+        const distanceSq = dx * dx + dy * dy;
+        const radiusSq = hazard.radius * hazard.radius;
+        if (hazard.kind === "slowField" && distanceSq <= radiusSq) {
           this.playerSlowUntil = Math.max(this.playerSlowUntil, time + 120);
           this.playerSlowMultiplier = Math.min(this.playerSlowMultiplier, hazard.slowMultiplier ?? 0.55);
         }
         if (time >= hazard.nextTickAt) {
           hazard.nextTickAt = time + 250;
-          if (distance <= hazard.radius) {
+          if (distanceSq <= radiusSq) {
             this.damagePlayer(hazard.damagePerTick);
           }
         }
-        return true;
+        this.hazards[writeIndex] = hazard;
+        writeIndex += 1;
+        continue;
       }
 
       const endX = hazard.x + Math.cos(hazard.angle ?? 0) * (hazard.length ?? 0);
       const endY = hazard.y + Math.sin(hazard.angle ?? 0) * (hazard.length ?? 0);
-      const nearest = Phaser.Geom.Line.GetNearestPoint(new Phaser.Geom.Line(hazard.x, hazard.y, endX, endY), new Phaser.Math.Vector2(this.player.x, this.player.y));
-      const distance = Phaser.Math.Distance.Between(this.player.x, this.player.y, nearest.x, nearest.y);
+      const lineDx = endX - hazard.x;
+      const lineDy = endY - hazard.y;
+      const lineLengthSq = lineDx * lineDx + lineDy * lineDy || 1;
+      const t = Phaser.Math.Clamp(((this.cachedPlayerX - hazard.x) * lineDx + (this.cachedPlayerY - hazard.y) * lineDy) / lineLengthSq, 0, 1);
+      const nearestX = hazard.x + lineDx * t;
+      const nearestY = hazard.y + lineDy * t;
+      const nearestDx = this.cachedPlayerX - nearestX;
+      const nearestDy = this.cachedPlayerY - nearestY;
+      const width = hazard.width ?? hazard.radius;
+      const distanceSq = nearestDx * nearestDx + nearestDy * nearestDy;
       if (time >= hazard.nextTickAt) {
         hazard.nextTickAt = time + 180;
-        if (distance <= (hazard.width ?? hazard.radius)) {
+        if (distanceSq <= width * width) {
           this.damagePlayer(hazard.damagePerTick);
         }
       }
-      return true;
-    });
+      this.hazards[writeIndex] = hazard;
+      writeIndex += 1;
+    }
+
+    this.hazards.length = writeIndex;
 
     if (time >= this.playerSlowUntil) {
       this.playerSlowMultiplier = 1;
@@ -3179,15 +3661,22 @@ export class GameScene extends Phaser.Scene {
   }
 
   private updateFloatingTexts(delta: number, time: number): void {
-    this.floatingTexts = this.floatingTexts.filter((text) => {
+    let writeIndex = 0;
+
+    for (let index = 0; index < this.floatingTexts.length; index += 1) {
+      const text = this.floatingTexts[index];
       if (time >= text.expiresAt) {
         text.destroy();
-        return false;
+        continue;
       }
+
       text.y += text.velocityY * (delta / 1000);
       text.alpha = Phaser.Math.Clamp((text.expiresAt - time) / 700, 0, 1);
-      return true;
-    });
+      this.floatingTexts[writeIndex] = text;
+      writeIndex += 1;
+    }
+
+    this.floatingTexts.length = writeIndex;
   }
 
   private updateBanner(time: number): void {
@@ -3196,6 +3685,14 @@ export class GameScene extends Phaser.Scene {
   }
 
   private updateHud(time: number): void {
+    if (!this.hudForceRefresh && this.lastHudMode === this.run.flowMode && time < this.nextHudRefreshAt) {
+      return;
+    }
+
+    this.hudForceRefresh = false;
+    this.lastHudMode = this.run.flowMode;
+    this.nextHudRefreshAt = time + HUD_UPDATE_INTERVAL_MS;
+
     const hpRatio = Phaser.Math.Clamp(this.run.hp / Math.max(1, this.run.stats.maxHp), 0, 1);
     const xpRatio = Phaser.Math.Clamp(this.run.xp / Math.max(1, this.run.xpToNext), 0, 1);
     let timerValue = 40;
@@ -3206,19 +3703,25 @@ export class GameScene extends Phaser.Scene {
       timerValue = Math.max(0, Math.ceil((PHASE_DURATION_MS - (this.livePauseStartedAt - this.run.phaseStartedAt)) / 1000));
     }
 
-    this.hpBarFill.clear();
-    this.hpBarFill.fillStyle(0xdf564f, 1);
-    this.hpBarFill.fillRoundedRect(36, 28, 216 * hpRatio, 8, 4);
-    this.xpBarFill.clear();
-    this.xpBarFill.fillStyle(0x7ce6cf, 1);
-    this.xpBarFill.fillRoundedRect(36, 60, 216 * xpRatio, 8, 4);
+    if (Math.abs(hpRatio - this.lastHpRatio) > 0.001) {
+      this.lastHpRatio = hpRatio;
+      this.hpBarFill.clear();
+      this.hpBarFill.fillStyle(0xdf564f, 1);
+      this.hpBarFill.fillRoundedRect(36, 28, 216 * hpRatio, 8, 4);
+    }
+    if (Math.abs(xpRatio - this.lastXpRatio) > 0.001) {
+      this.lastXpRatio = xpRatio;
+      this.xpBarFill.clear();
+      this.xpBarFill.fillStyle(0x7ce6cf, 1);
+      this.xpBarFill.fillRoundedRect(36, 60, 216 * xpRatio, 8, 4);
+    }
 
     this.hpLabelText.setText(`${CHARACTERS[this.selectedCharacterId].label.toUpperCase()} HP ${Math.ceil(this.run.hp)} / ${this.run.stats.maxHp}`);
     this.xpLabelText.setText(`XP ${this.run.xp} / ${this.run.xpToNext}`);
     this.levelText.setText(`LV ${this.run.level}`);
-    this.phaseText.setText(`PHASE ${this.run.phase}`);
+    this.phaseText.setText(`FASE ${this.run.phase}`);
     this.timerText.setText(this.formatSeconds(timerValue));
-    this.enemyCountText.setText(`ENEMIES ${this.getActiveEnemyCount()}`);
+    this.enemyCountText.setText(`INIMIGOS ${this.getActiveEnemyCount()}`);
     this.buildSummaryText.setText(
       this.run.buildSnapshot.dominantTags.length > 0
         ? `BUILD  ${this.run.selectedItems.length} ITEMS  •  ${this.run.buildSnapshot.dominantTags
@@ -3244,15 +3747,15 @@ export class GameScene extends Phaser.Scene {
     this.weaponStripContainer.setVisible(showRuntimeHud);
 
     if (this.run.flowMode === "mainMenu") {
-      this.hintText.setText("CLICK PLAY TO BEGIN");
+      this.hintText.setText("CLIQUE EM JOGAR PARA COMEÇAR");
     } else if (this.run.flowMode === "characterSelect") {
-      this.hintText.setText("PRESS SPACE / ENTER TO START");
+      this.hintText.setText("ESPAÇO / ENTER PARA INICIAR");
     } else if (this.run.flowMode === "gameOver") {
-      this.hintText.setText("PRESS SPACE / ENTER TO RESTART");
+      this.hintText.setText("ESPAÇO / ENTER PARA RECOMEÇAR");
     } else if (this.run.flowMode === "itemDraft" || this.run.flowMode === "weaponDraft") {
-      this.hintText.setText("PRESS 1 / 2 / 3 OR CLICK A CARD");
+      this.hintText.setText("1 / 2 / 3, ENTER OU CLIQUE EM UM CARD");
     } else if (this.run.flowMode === "statsPanel") {
-      this.hintText.setText("TAB / ESC TO CLOSE BUILD STATS");
+      this.hintText.setText("TAB / ESC PARA FECHAR A BUILD");
     } else {
       this.hintText.setText(`MOVE - WASD / ARROWS  •  SHIELDS ${this.run.shieldCharges}`);
     }
@@ -3311,11 +3814,23 @@ export class GameScene extends Phaser.Scene {
       createdAt: time,
       expiresAt: time + NOTIFICATION_DURATION_MS
     };
-    this.run.notifications = [...this.run.notifications, notification].slice(-6);
+    if (this.run.notifications.length >= 6) {
+      this.run.notifications.shift();
+    }
+    this.run.notifications.push(notification);
   }
 
   private updateNotificationsUi(time: number): void {
-    this.run.notifications = this.run.notifications.filter((notification) => notification.expiresAt > time);
+    let writeIndex = 0;
+    for (let index = 0; index < this.run.notifications.length; index += 1) {
+      const notification = this.run.notifications[index];
+      if (notification.expiresAt <= time) {
+        continue;
+      }
+      this.run.notifications[writeIndex] = notification;
+      writeIndex += 1;
+    }
+    this.run.notifications.length = writeIndex;
     const visible = [...this.run.notifications].slice(-this.notificationSlots.length).reverse();
     this.notificationSlots.forEach((slot, index) => {
       const notification = visible[index];
@@ -3377,79 +3892,433 @@ export class GameScene extends Phaser.Scene {
     this.overlayElements.push(backdrop, titleText, subtitleText);
   }
 
+  private getOverlayLayoutMetrics(): OverlayLayoutMetrics {
+    const paddingX = 78;
+    return {
+      left: paddingX,
+      top: 154,
+      width: VIEW_WIDTH - paddingX * 2,
+      height: VIEW_HEIGHT - 196,
+      density: VIEW_WIDTH < 1180 ? "compact" : "comfortable"
+    };
+  }
+
+  private getResponsiveRowCount(totalEntries: number): number {
+    if (totalEntries <= 10) {
+      return 1;
+    }
+    if (totalEntries <= 18) {
+      return 2;
+    }
+    if (totalEntries <= 26) {
+      return 3;
+    }
+    return 4;
+  }
+
+  private fitTextBlock(text: Phaser.GameObjects.Text, maxWidth: number, maxHeight: number, minFontSize = 12): void {
+    let fontSize = Number.parseInt(`${text.style.fontSize ?? 16}`, 10);
+    while ((text.height > maxHeight || text.width > maxWidth) && fontSize > minFontSize) {
+      fontSize -= 1;
+      text.setFontSize(fontSize);
+    }
+
+    if (text.height <= maxHeight && text.width <= maxWidth) {
+      return;
+    }
+
+    let workingText = text.text;
+    while (workingText.length > 6 && (text.height > maxHeight || text.width > maxWidth)) {
+      workingText = `${workingText.slice(0, Math.max(0, workingText.length - 4)).trimEnd()}...`;
+      text.setText(workingText);
+    }
+  }
+
+  private applyOverlayFocus(entries: FocusableOverlayEntry[], activeIndex: number): void {
+    entries.forEach((entry, index) => entry.setFocused(index === activeIndex));
+  }
+
+  private moveGridFocus(currentIndex: number, total: number, columns: number, dx: number, dy: number): number {
+    if (total === 0) {
+      return 0;
+    }
+
+    const rows = Math.ceil(total / Math.max(1, columns));
+    const currentRow = Math.floor(currentIndex / columns);
+    const currentColumn = currentIndex % columns;
+    const nextRow = Phaser.Math.Clamp(currentRow + dy, 0, rows - 1);
+    const nextColumn = Phaser.Math.Clamp(currentColumn + dx, 0, columns - 1);
+    return Phaser.Math.Clamp(nextRow * columns + nextColumn, 0, total - 1);
+  }
+
+  private updateCharacterFocus(nextIndex: number): void {
+    this.characterFocusIndex = Phaser.Math.Clamp(nextIndex, 0, this.characterEntries.length - 1);
+    this.selectedCharacterId = CHARACTER_ORDER[this.characterFocusIndex] ?? this.selectedCharacterId;
+    this.openCharacterSelect();
+  }
+
+  private handleCharacterSelectionInput(): void {
+    let nextIndex = this.characterFocusIndex;
+
+    if (Phaser.Input.Keyboard.JustDown(this.keys.a) || Phaser.Input.Keyboard.JustDown(this.cursors.left)) {
+      nextIndex = this.moveGridFocus(nextIndex, this.characterEntries.length, this.characterGridColumns, -1, 0);
+    } else if (Phaser.Input.Keyboard.JustDown(this.keys.d) || Phaser.Input.Keyboard.JustDown(this.cursors.right)) {
+      nextIndex = this.moveGridFocus(nextIndex, this.characterEntries.length, this.characterGridColumns, 1, 0);
+    } else if (Phaser.Input.Keyboard.JustDown(this.keys.w) || Phaser.Input.Keyboard.JustDown(this.cursors.up)) {
+      nextIndex = this.moveGridFocus(nextIndex, this.characterEntries.length, this.characterGridColumns, 0, -1);
+    } else if (Phaser.Input.Keyboard.JustDown(this.keys.s) || Phaser.Input.Keyboard.JustDown(this.cursors.down)) {
+      nextIndex = this.moveGridFocus(nextIndex, this.characterEntries.length, this.characterGridColumns, 0, 1);
+    }
+
+    if (nextIndex !== this.characterFocusIndex) {
+      this.overlayInputMode = "keyboard";
+      this.updateCharacterFocus(nextIndex);
+    }
+  }
+
+  private handleDraftFocusInput(): void {
+    if (this.draftEntries.length === 0) {
+      return;
+    }
+
+    let nextIndex = this.draftFocusIndex;
+    if (Phaser.Input.Keyboard.JustDown(this.keys.a) || Phaser.Input.Keyboard.JustDown(this.cursors.left)) {
+      nextIndex = Phaser.Math.Clamp(nextIndex - 1, 0, this.draftEntries.length - 1);
+    } else if (Phaser.Input.Keyboard.JustDown(this.keys.d) || Phaser.Input.Keyboard.JustDown(this.cursors.right)) {
+      nextIndex = Phaser.Math.Clamp(nextIndex + 1, 0, this.draftEntries.length - 1);
+    }
+
+    if (nextIndex !== this.draftFocusIndex) {
+      this.overlayInputMode = "keyboard";
+      this.draftFocusIndex = nextIndex;
+      this.applyOverlayFocus(this.draftEntries, this.draftFocusIndex);
+    }
+
+    if (Phaser.Input.Keyboard.JustDown(this.keys.enter) || Phaser.Input.Keyboard.JustDown(this.keys.space)) {
+      this.draftEntries[this.draftFocusIndex]?.select();
+    }
+  }
+
+  private handleStatsPanelFocusInput(): void {
+    if (this.statsEntries.length === 0) {
+      return;
+    }
+
+    let nextIndex = this.statsFocusIndex;
+    if (Phaser.Input.Keyboard.JustDown(this.keys.a) || Phaser.Input.Keyboard.JustDown(this.cursors.left)) {
+      nextIndex = this.moveGridFocus(nextIndex, this.statsEntries.length, this.statsGridColumns, -1, 0);
+    } else if (Phaser.Input.Keyboard.JustDown(this.keys.d) || Phaser.Input.Keyboard.JustDown(this.cursors.right)) {
+      nextIndex = this.moveGridFocus(nextIndex, this.statsEntries.length, this.statsGridColumns, 1, 0);
+    } else if (Phaser.Input.Keyboard.JustDown(this.keys.w) || Phaser.Input.Keyboard.JustDown(this.cursors.up)) {
+      nextIndex = this.moveGridFocus(nextIndex, this.statsEntries.length, this.statsGridColumns, 0, -1);
+    } else if (Phaser.Input.Keyboard.JustDown(this.keys.s) || Phaser.Input.Keyboard.JustDown(this.cursors.down)) {
+      nextIndex = this.moveGridFocus(nextIndex, this.statsEntries.length, this.statsGridColumns, 0, 1);
+    }
+
+    if (nextIndex !== this.statsFocusIndex) {
+      this.overlayInputMode = "keyboard";
+      this.statsFocusIndex = nextIndex;
+      this.applyOverlayFocus(this.statsEntries, this.statsFocusIndex);
+      this.updateStatsDetailPanel(this.run.buildSnapshot.inventoryEntries[this.statsFocusIndex]);
+    }
+  }
+
+  private formatDraftProfile(profile: ItemOfferChoice["profile"]): string {
+    switch (profile) {
+      case "safe":
+        return "Perfil seguro";
+      case "synergy":
+        return "Perfil synergy";
+      case "bold":
+        return "Perfil agressivo";
+      default:
+        return "Perfil";
+    }
+  }
+
+  private formatItemCategory(category: ItemCategory): string {
+    switch (category) {
+      case "offense":
+        return "Ofensiva";
+      case "utility":
+        return "Utilidade";
+      case "projectile":
+        return "Projétil";
+      case "survivability":
+        return "Sobrevivência";
+      case "special":
+        return "Especial";
+      default:
+        return "Build";
+    }
+  }
+
+  private getPolarityColor(polarity: BuildStatLine["polarity"]): string {
+    switch (polarity) {
+      case "positive":
+        return "#9be7ad";
+      case "negative":
+        return "#ffaca0";
+      default:
+        return "#e7eee9";
+    }
+  }
+
+  private renderStatGroupPanel(
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+    title: string,
+    accent: number,
+    lines: BuildStatLine[]
+  ): void {
+    const panel = this.createOverlayPanel(x, y, width, height, 0x111816, accent);
+    panel.setAlpha(0.98);
+    const titleText = this.add
+      .text(x - width / 2 + 18, y - height / 2 + 16, title, {
+        fontFamily: "Trebuchet MS",
+        fontSize: "16px",
+        color: "#f8f6eb",
+        stroke: "#161b19",
+        strokeThickness: 3
+      })
+      .setDepth(75);
+    this.overlayElements.push(titleText);
+
+    lines.slice(0, 6).forEach((line, index) => {
+      const labelText = this.add
+        .text(x - width / 2 + 18, y - height / 2 + 48 + index * 28, line.label, {
+          fontFamily: "Trebuchet MS",
+          fontSize: "13px",
+          color: "#bac8c1"
+        })
+        .setDepth(75);
+      const valueText = this.add
+        .text(x + width / 2 - 18, y - height / 2 + 48 + index * 28, line.value, {
+          fontFamily: "Trebuchet MS",
+          fontSize: "13px",
+          color: this.getPolarityColor(line.polarity)
+        })
+        .setOrigin(1, 0)
+        .setDepth(75);
+      this.fitTextBlock(labelText, width - 130, 20, 11);
+      this.fitTextBlock(valueText, 108, 20, 11);
+      this.overlayElements.push(labelText, valueText);
+    });
+  }
+
+  private createStatsInventoryChip(entry: BuildInventoryEntry, x: number, y: number, onHover: () => void): FocusableOverlayEntry {
+    const panel = this.add.container(x, y).setDepth(75);
+    const background = this.add.rectangle(0, 0, 70, 70, entry.fill, 0.96).setStrokeStyle(2, entry.border, 0.88);
+    const icon = this.add.image(0, -6, entry.iconKey ?? "upgrade-special").setScale(entry.iconKey === "player" ? 1 : 0.9);
+    const stack = this.add
+      .text(24, 22, entry.stackCount > 1 ? `${entry.stackCount}` : "", {
+        fontFamily: "Trebuchet MS",
+        fontSize: "11px",
+        color: "#f8f6eb",
+        stroke: "#161b19",
+        strokeThickness: 2
+      })
+      .setOrigin(1, 1);
+    panel.add([background, icon, stack]);
+    panel.setSize(70, 70);
+    panel.setInteractive(new Phaser.Geom.Rectangle(-35, -35, 70, 70), Phaser.Geom.Rectangle.Contains);
+    panel.on("pointerover", () => onHover());
+    panel.on("pointerup", () => onHover());
+    this.overlayElements.push(panel);
+
+    const chip = panel as FocusableOverlayEntry;
+    chip.setFocused = (focused: boolean) => {
+      background.setStrokeStyle(focused ? 3 : 2, focused ? entry.accent : entry.border, focused ? 1 : 0.88);
+      background.setFillStyle(focused ? Phaser.Display.Color.IntegerToColor(entry.fill).lighten(8).color : entry.fill, 0.96);
+      panel.setScale(focused ? 1.06 : 1);
+    };
+    chip.select = onHover;
+    return chip;
+  }
+
+  private updateStatsDetailPanel(entry: BuildInventoryEntry | undefined): void {
+    if (!entry || !this.statsDetailTitle || !this.statsDetailMeta || !this.statsDetailDescription || !this.statsDetailPros || !this.statsDetailCons || !this.statsDetailFooter) {
+      return;
+    }
+
+    this.statsDetailTitle.setText(entry.label.toUpperCase());
+    this.fitTextBlock(this.statsDetailTitle, 254, 44, 16);
+    this.statsDetailMeta.setText(
+      [
+        entry.rarityLabel ? `Raridade  ${entry.rarityLabel}` : entry.categoryLabel,
+        entry.categoryLabel,
+        entry.isUnique ? "Único" : `Stacks  ${entry.stackCount}`
+      ].join("\n")
+    );
+    this.fitTextBlock(this.statsDetailMeta, 254, 62, 12);
+    this.statsDetailDescription.setText(entry.shortDescription);
+    this.fitTextBlock(this.statsDetailDescription, 254, 58, 12);
+    this.statsDetailPros.setText([entry.pros.length > 0 ? "Positivos" : "Positivos\nSem bônus", ...entry.pros.map((line) => `+ ${line}`)].join("\n"));
+    this.fitTextBlock(this.statsDetailPros, 254, 72, 12);
+    this.statsDetailCons.setText([entry.cons.length > 0 ? "Negativos" : "Negativos\nSem trade-offs", ...entry.cons.map((line) => `- ${line}`)].join("\n"));
+    this.fitTextBlock(this.statsDetailCons, 254, 62, 12);
+    this.statsDetailFooter.setText(
+      [`Tags  ${entry.tags.join(", ") || "sem tags"}`, `Sinergias  ${entry.synergies.join(", ") || "nenhuma"}`].join("\n")
+    );
+    this.fitTextBlock(this.statsDetailFooter, 254, 44, 11);
+  }
+
   private createDraftCard(options: {
     x: number;
     y: number;
     width: number;
     height: number;
     title: string;
-    body: string;
+    summary?: string;
+    body?: string;
     accent: number;
     hotkeyIndex: number;
     onSelect: () => void;
+    onHover?: () => void;
     iconKey?: string;
     selected?: boolean;
     fillColor?: number;
-    bodyColor?: string;
+    rarityLabel?: string;
+    categoryLabel?: string;
+    tags?: string[];
+    synergies?: string[];
+    pros?: string[];
+    cons?: string[];
     footerLabel?: string;
-    bodyFontSize?: string;
-  }): Phaser.GameObjects.Container {
+    bodyColor?: string;
+  }): FocusableOverlayEntry {
     const panel = this.add.container(options.x, options.y).setDepth(75);
-    const hasIcon = Boolean(options.iconKey);
     const baseFill = options.fillColor ?? (options.selected ? 0x22302c : 0x16201d);
-    const card = this.add
-      .rectangle(0, 0, options.width, options.height, baseFill, 0.98)
-      .setStrokeStyle(2, options.accent, 0.9);
-    const accentBar = this.add.rectangle(0, -options.height / 2 + 9, options.width - 24, 9, options.accent, 1);
-    panel.add([card, accentBar]);
+    const glow = this.add.graphics();
+    const frame = this.add.graphics();
+    const drawCardState = (focused: boolean) => {
+      glow.clear();
+      frame.clear();
+      if (focused) {
+        glow.fillStyle(options.accent, 0.16);
+        glow.fillRoundedRect(-options.width / 2 - 4, -options.height / 2 - 4, options.width + 8, options.height + 8, 24);
+      }
+      frame.fillStyle(focused ? 0x22302c : baseFill, 0.98);
+      frame.lineStyle(focused ? 3 : 2, options.accent, focused ? 1 : 0.92);
+      frame.fillRoundedRect(-options.width / 2, -options.height / 2, options.width, options.height, 22);
+      frame.strokeRoundedRect(-options.width / 2, -options.height / 2, options.width, options.height, 22);
+      frame.fillStyle(options.accent, focused ? 0.85 : 0.72);
+      frame.fillRoundedRect(-options.width / 2 + 14, -options.height / 2 + 14, options.width - 28, 8, 6);
+    };
+    drawCardState(Boolean(options.selected));
 
-    if (options.iconKey) {
-      const icon = this.add.image(0, -options.height / 2 + 48, options.iconKey).setScale(options.iconKey === "player" ? 0.9 : 1);
-      panel.add(icon);
-    }
-
+    const iconSlot = this.add.rectangle(-options.width / 2 + 48, -options.height / 2 + 62, 72, 72, 0x111816, 0.98).setStrokeStyle(2, options.accent, 0.7);
+    const icon = this.add
+      .image(-options.width / 2 + 48, -options.height / 2 + 62, options.iconKey ?? "upgrade-special")
+      .setScale(options.iconKey === "player" ? 1 : 0.95);
     const titleText = this.add
-      .text(0, -options.height / 2 + (hasIcon ? 78 : 38), options.title, {
+      .text(-options.width / 2 + 96, -options.height / 2 + 24, options.title, {
         fontFamily: "Trebuchet MS",
-        fontSize: "21px",
+        fontSize: "23px",
         color: "#f8f6eb",
-        align: "center",
-        wordWrap: { width: options.width - 32 }
+        align: "left",
+        wordWrap: { width: options.width - 150 }
       })
-      .setOrigin(0.5, 0);
-    const bodyText = this.add
-      .text(0, hasIcon ? 20 : -2, options.body, {
+      .setOrigin(0, 0);
+    this.fitTextBlock(titleText, options.width - 150, 54, 17);
+
+    const rarityPill = this.add.rectangle(options.width / 2 - 66, -options.height / 2 + 86, 104, 26, 0x101715, 0.92).setStrokeStyle(1, options.accent, 0.72);
+    const rarityText = this.add
+      .text(options.width / 2 - 66, -options.height / 2 + 86, options.rarityLabel ?? "Build", {
         fontFamily: "Trebuchet MS",
-        fontSize: options.bodyFontSize ?? "15px",
-        color: options.bodyColor ?? "#dbe5dc",
-        align: "center",
-        wordWrap: { width: options.width - 30 }
+        fontSize: "12px",
+        color: "#dce7e2"
       })
-      .setOrigin(0.5, 0.5);
+      .setOrigin(0.5);
+
+    const summaryText = this.add
+      .text(-options.width / 2 + 24, -options.height / 2 + 132, options.summary ?? options.body ?? "", {
+        fontFamily: "Trebuchet MS",
+        fontSize: "15px",
+        color: options.bodyColor ?? "#dbe5dc",
+        align: "left",
+        wordWrap: { width: options.width - 48 }
+      })
+      .setOrigin(0, 0);
+    this.fitTextBlock(summaryText, options.width - 48, 44, 13);
+
+    const categoryText = this.add
+      .text(-options.width / 2 + 24, -options.height / 2 + 180, options.categoryLabel ?? "Build", {
+        fontFamily: "Trebuchet MS",
+        fontSize: "13px",
+        color: "#9ecac1",
+        stroke: "#111816",
+        strokeThickness: 2
+      })
+      .setOrigin(0, 0);
+    const tagText = this.add
+      .text(-options.width / 2 + 24, -options.height / 2 + 202, `Tags  ${(options.tags ?? []).join(", ") || "sem tags"}`, {
+        fontFamily: "Trebuchet MS",
+        fontSize: "12px",
+        color: "#bdd0c9",
+        wordWrap: { width: options.width - 48 }
+      })
+      .setOrigin(0, 0);
+    this.fitTextBlock(tagText, options.width - 48, 32, 11);
+
+    const prosText = this.add
+      .text(-options.width / 2 + 24, -options.height / 2 + 236, (options.pros ?? []).map((entry) => `+ ${entry}`).join("\n") || "+ sem bônus", {
+        fontFamily: "Trebuchet MS",
+        fontSize: "14px",
+        color: "#9ae7ac",
+        wordWrap: { width: options.width - 48 }
+      })
+      .setOrigin(0, 0);
+    this.fitTextBlock(prosText, options.width - 48, 54, 12);
+
+    const consText = this.add
+      .text(-options.width / 2 + 24, -options.height / 2 + 294, (options.cons ?? []).map((entry) => `- ${entry}`).join("\n") || "- sem trade-offs", {
+        fontFamily: "Trebuchet MS",
+        fontSize: "14px",
+        color: "#ffab9f",
+        wordWrap: { width: options.width - 48 }
+      })
+      .setOrigin(0, 0);
+    this.fitTextBlock(consText, options.width - 48, 42, 12);
+
+    const synergyText = this.add
+      .text(-options.width / 2 + 24, options.height / 2 - 58, `Sinergias  ${(options.synergies ?? []).join(", ") || "nenhuma"}`, {
+        fontFamily: "Trebuchet MS",
+        fontSize: "12px",
+        color: "#c9d6cf",
+        wordWrap: { width: options.width - 48 }
+      })
+      .setOrigin(0, 0.5);
+    this.fitTextBlock(synergyText, options.width - 48, 28, 11);
+
     const footerText = this.add
-      .text(0, options.height / 2 - 22, options.footerLabel ?? `PRESS ${options.hotkeyIndex + 1} OR CLICK`, {
+      .text(0, options.height / 2 - 20, options.footerLabel ?? `Pressione ${options.hotkeyIndex + 1}, Enter ou clique`, {
         fontFamily: "Trebuchet MS",
         fontSize: "12px",
         color: "#c9d3cb"
       })
       .setOrigin(0.5);
-    panel.add([titleText, bodyText, footerText]);
+    panel.add([glow, frame, iconSlot, icon, titleText, rarityPill, rarityText, summaryText, categoryText, tagText, prosText, consText, synergyText, footerText]);
     panel.setSize(options.width, options.height);
     panel.setInteractive(
       new Phaser.Geom.Rectangle(-options.width / 2, -options.height / 2, options.width, options.height),
       Phaser.Geom.Rectangle.Contains
     );
     panel.on("pointerover", () => {
-      card.setFillStyle(0x24332f, 1);
-      panel.y = options.y - 6;
-    });
-    panel.on("pointerout", () => {
-      card.setFillStyle(baseFill, 0.98);
-      panel.y = options.y;
+      options.onHover?.();
     });
     panel.on("pointerup", () => options.onSelect());
     this.overlayElements.push(panel);
-    return panel;
+    const entry = panel as FocusableOverlayEntry;
+    entry.setFocused = (focused: boolean) => {
+      drawCardState(focused);
+      panel.y = focused ? options.y - 8 : options.y;
+      panel.setScale(focused ? 1.02 : 1);
+    };
+    entry.select = options.onSelect;
+    return entry;
   }
 
   private createWeaponPreview(panel: Phaser.GameObjects.Container, weapon: WeaponDef): void {
@@ -3527,14 +4396,14 @@ export class GameScene extends Phaser.Scene {
     character: (typeof CHARACTERS)[CharacterId],
     selected: boolean,
     onSelect: () => void
-  ): void {
+  ): FocusableOverlayEntry {
     const panel = this.add.container(x, y).setDepth(75);
     const background = this.add
-      .rectangle(0, 0, 60, 60, selected ? character.panelTint : 0x121816, 0.98)
+      .rectangle(0, 0, 66, 66, selected ? character.panelTint : 0x121816, 0.98)
       .setStrokeStyle(2, selected ? character.accent : 0x677570, 0.94);
-    const icon = this.add.image(0, -4, "player").setTint(character.portraitTint ?? character.accent).setScale(1.1);
+    const icon = this.add.image(0, -6, "player").setTint(character.portraitTint ?? character.accent).setScale(1.1);
     const label = this.add
-      .text(0, 24, character.label.slice(0, 3).toUpperCase(), {
+      .text(0, 26, character.label.slice(0, 3).toUpperCase(), {
         fontFamily: "Trebuchet MS",
         fontSize: "11px",
         color: selected ? "#f8f6eb" : "#dbe5dc",
@@ -3543,18 +4412,22 @@ export class GameScene extends Phaser.Scene {
       })
       .setOrigin(0.5);
     panel.add([background, icon, label]);
-    panel.setSize(60, 60);
-    panel.setInteractive(new Phaser.Geom.Rectangle(-30, -30, 60, 60), Phaser.Geom.Rectangle.Contains);
+    panel.setSize(66, 66);
+    panel.setInteractive(new Phaser.Geom.Rectangle(-33, -33, 66, 66), Phaser.Geom.Rectangle.Contains);
     panel.on("pointerover", () => {
-      background.setFillStyle(selected ? character.panelTint : 0x22302c, 1);
-      panel.setScale(1.04);
-    });
-    panel.on("pointerout", () => {
-      background.setFillStyle(selected ? character.panelTint : 0x121816, 0.98);
-      panel.setScale(1);
+      onSelect();
     });
     panel.on("pointerup", () => onSelect());
     this.overlayElements.push(panel);
+    const entry = panel as FocusableOverlayEntry;
+    entry.setFocused = (focused: boolean) => {
+      background.setFillStyle(focused ? character.panelTint : 0x121816, 0.98);
+      background.setStrokeStyle(focused ? 3 : 2, focused ? character.accent : 0x677570, focused ? 1 : 0.94);
+      label.setColor(focused ? "#f8f6eb" : "#dbe5dc");
+      panel.setScale(focused ? 1.08 : 1);
+    };
+    entry.select = onSelect;
+    return entry;
   }
 
   private createActionButton(
@@ -3601,21 +4474,244 @@ export class GameScene extends Phaser.Scene {
     }
     this.overlayElements = [];
     this.activeChoiceActions = [];
+    this.characterEntries = [];
+    this.draftEntries = [];
+    this.statsEntries = [];
+    this.statsDetailTitle = undefined;
+    this.statsDetailMeta = undefined;
+    this.statsDetailDescription = undefined;
+    this.statsDetailPros = undefined;
+    this.statsDetailCons = undefined;
+    this.statsDetailFooter = undefined;
   }
 
   private getNearestEnemyTarget(): EnemySprite | null {
-    return findNearestTarget(
-      { x: this.player.x, y: this.player.y },
-      (this.enemies.getChildren() as EnemySprite[]).filter((enemy) => enemy.active)
-    );
+    if (this.cachedNearestEnemy?.active) {
+      return this.cachedNearestEnemy;
+    }
+
+    this.cachedNearestEnemy = findNearestTarget({ x: this.cachedPlayerX, y: this.cachedPlayerY }, this.activeEnemiesScratch);
+    return this.cachedNearestEnemy;
   }
 
   private getActiveEnemyCount(): number {
-    return (this.enemies.getChildren() as EnemySprite[]).filter((enemy) => enemy.active).length + this.run.pendingSpawns.length;
+    return this.activeEnemyCountCache + this.run.pendingSpawns.length;
   }
 
   private getActiveNormalEnemyCount(): number {
-    return (this.enemies.getChildren() as EnemySprite[]).filter((enemy) => enemy.active && enemy.enemyType !== "boss").length;
+    return this.activeNormalEnemyCountCache;
+  }
+
+  private refreshEnemySpatialState(): void {
+    this.activeEnemiesScratch.length = 0;
+    let normalCount = 0;
+
+    for (const enemy of this.enemies.getChildren() as EnemySprite[]) {
+      if (!enemy.active) {
+        continue;
+      }
+
+      this.activeEnemiesScratch.push(enemy);
+      if (enemy.enemyType !== "boss") {
+        normalCount += 1;
+      }
+    }
+
+    this.activeEnemyCountCache = this.activeEnemiesScratch.length;
+    this.activeNormalEnemyCountCache = normalCount;
+    this.enemyGrid.rebuild(this.activeEnemiesScratch);
+    this.cachedNearestEnemy = null;
+  }
+
+  private getPendingNormalSpawnCount(): number {
+    let count = 0;
+
+    for (let index = 0; index < this.run.pendingSpawns.length; index += 1) {
+      if (this.run.pendingSpawns[index].enemyType !== "boss") {
+        count += 1;
+      }
+    }
+
+    return count;
+  }
+
+  private sortEnemiesByDistance(enemies: EnemySprite[], x: number, y: number): void {
+    enemies.sort((a, b) => {
+      const adx = a.x - x;
+      const ady = a.y - y;
+      const bdx = b.x - x;
+      const bdy = b.y - y;
+      return adx * adx + ady * ady - (bdx * bdx + bdy * bdy);
+    });
+  }
+
+  private findMergeableXpOrb(x: number, y: number, radius: number): XpOrbSprite | null {
+    const radiusSq = radius * radius;
+    let bestOrb: XpOrbSprite | null = null;
+    let bestDistanceSq = Number.POSITIVE_INFINITY;
+
+    for (const orb of this.xpOrbs.getChildren() as XpOrbSprite[]) {
+      if (!orb.active) {
+        continue;
+      }
+
+      const dx = orb.x - x;
+      const dy = orb.y - y;
+      const distanceSq = dx * dx + dy * dy;
+      if (distanceSq > radiusSq || distanceSq >= bestDistanceSq) {
+        continue;
+      }
+
+      bestOrb = orb;
+      bestDistanceSq = distanceSq;
+    }
+
+    return bestOrb;
+  }
+
+  private findNearestXpOrb(x: number, y: number): XpOrbSprite | null {
+    let bestOrb: XpOrbSprite | null = null;
+    let bestDistanceSq = Number.POSITIVE_INFINITY;
+
+    for (const orb of this.xpOrbs.getChildren() as XpOrbSprite[]) {
+      if (!orb.active) {
+        continue;
+      }
+
+      const dx = orb.x - x;
+      const dy = orb.y - y;
+      const distanceSq = dx * dx + dy * dy;
+      if (distanceSq >= bestDistanceSq) {
+        continue;
+      }
+
+      bestOrb = orb;
+      bestDistanceSq = distanceSq;
+    }
+
+    return bestOrb;
+  }
+
+  private removeXpOrbState(orbId: number): void {
+    for (let index = 0; index < this.run.xpOrbs.length; index += 1) {
+      if (this.run.xpOrbs[index].id !== orbId) {
+        continue;
+      }
+
+      const lastIndex = this.run.xpOrbs.length - 1;
+      this.run.xpOrbs[index] = this.run.xpOrbs[lastIndex];
+      this.run.xpOrbs.length = lastIndex;
+      return;
+    }
+  }
+
+  private spawnImageEffect(
+    pool: FxSprite[],
+    maxSize: number,
+    texture: string,
+    options: {
+      x: number;
+      y: number;
+      depth: number;
+      tint?: number;
+      tintFill?: number;
+      scale: number;
+      alpha: number;
+      durationMs: number;
+      endScale?: number;
+      velocityX?: number;
+      velocityY?: number;
+      rotation?: number;
+    }
+  ): void {
+    const effect = this.acquireImageEffect(pool, maxSize, texture);
+    if (!effect) {
+      return;
+    }
+
+    effect
+      .setActive(true)
+      .setVisible(true)
+      .setTexture(texture)
+      .setPosition(options.x, options.y)
+      .setDepth(options.depth)
+      .setScale(options.scale)
+      .setAlpha(options.alpha)
+      .setRotation(options.rotation ?? 0);
+
+    if (typeof options.tintFill === "number") {
+      effect.setTintFill(options.tintFill);
+    } else if (typeof options.tint === "number") {
+      effect.clearTint();
+      effect.setTint(options.tint);
+    } else {
+      effect.clearTint();
+    }
+
+    effect.effectCreatedAt = this.time.now;
+    effect.effectExpiresAt = this.time.now + options.durationMs;
+    effect.effectVelocityX = options.velocityX ?? 0;
+    effect.effectVelocityY = options.velocityY ?? 0;
+    effect.effectStartAlpha = options.alpha;
+    effect.effectEndAlpha = 0;
+    effect.effectStartScale = options.scale;
+    effect.effectEndScale = options.endScale ?? options.scale * 0.45;
+  }
+
+  private acquireImageEffect(pool: FxSprite[], maxSize: number, texture: string): FxSprite | null {
+    for (const effect of pool) {
+      if (!effect.active) {
+        return effect;
+      }
+    }
+
+    if (pool.length >= maxSize) {
+      return null;
+    }
+
+    const effect = this.add.image(0, 0, texture).setVisible(false).setActive(false) as FxSprite;
+    effect.effectCreatedAt = 0;
+    effect.effectExpiresAt = 0;
+    effect.effectVelocityX = 0;
+    effect.effectVelocityY = 0;
+    effect.effectStartAlpha = 0;
+    effect.effectEndAlpha = 0;
+    effect.effectStartScale = 1;
+    effect.effectEndScale = 1;
+    pool.push(effect);
+    return effect;
+  }
+
+  private updateImageEffects(time: number, delta: number): void {
+    this.activeParticleCount = this.updateImageEffectPool(this.particleEffects, time, delta);
+    this.activeTrailCount = this.updateImageEffectPool(this.trailEffects, time, delta);
+    this.activeMuzzleFlashCount = this.updateImageEffectPool(this.muzzleFlashEffects, time, delta);
+    this.activeGhostCount = this.updateImageEffectPool(this.ghostEffects, time, delta);
+  }
+
+  private updateImageEffectPool(pool: FxSprite[], time: number, delta: number): number {
+    let activeCount = 0;
+
+    for (const effect of pool) {
+      if (!effect.active) {
+        continue;
+      }
+
+      if (time >= effect.effectExpiresAt) {
+        effect.setActive(false).setVisible(false);
+        continue;
+      }
+
+      activeCount += 1;
+      const duration = Math.max(1, effect.effectExpiresAt - effect.effectCreatedAt);
+      const progress = Phaser.Math.Clamp((time - effect.effectCreatedAt) / duration, 0, 1);
+      effect.x += effect.effectVelocityX * (delta / 1000);
+      effect.y += effect.effectVelocityY * (delta / 1000);
+      effect.setAlpha(Phaser.Math.Linear(effect.effectStartAlpha, effect.effectEndAlpha, progress));
+      effect.setScale(Phaser.Math.Linear(effect.effectStartScale, effect.effectEndScale, progress));
+    }
+
+    return activeCount;
   }
 
   private clearGroup(group: Phaser.Physics.Arcade.Group): void {
@@ -3634,18 +4730,25 @@ export class GameScene extends Phaser.Scene {
   }
 
   private disableProjectile(projectile: BulletSprite): void {
+    this.getBody(projectile).setVelocity(0, 0);
     projectile.disableBody(true, true);
   }
 
   private spawnMuzzleFlash(x: number, y: number, angle: number, tint: number, scale = 1): void {
-    const flash = this.add.image(x, y, "muzzle-flash").setDepth(18).setTint(tint).setRotation(angle).setScale(scale);
-    this.tweens.add({
-      targets: flash,
-      alpha: 0,
-      scaleX: scale * 0.45,
-      scaleY: scale * 0.45,
-      duration: 70,
-      onComplete: () => flash.destroy()
+    if (this.activeMuzzleFlashCount >= MAX_SIMULTANEOUS_MUZZLE_FLASHES) {
+      return;
+    }
+
+    this.spawnImageEffect(this.muzzleFlashEffects, FX_MUZZLE_FLASH_POOL_SIZE, "muzzle-flash", {
+      x,
+      y,
+      depth: 18,
+      tint,
+      scale,
+      alpha: 0.95,
+      durationMs: 70,
+      endScale: scale * 0.45,
+      rotation: angle
     });
   }
 
@@ -3664,18 +4767,28 @@ export class GameScene extends Phaser.Scene {
   }
 
   private spawnParticleBurst(x: number, y: number, count: number, tint: number): void {
-    for (let index = 0; index < count; index += 1) {
-      const particle = this.add.image(x, y, "particle-dot").setDepth(18).setTint(tint).setScale(Phaser.Math.FloatBetween(0.5, 1));
+    if (this.activeParticleCount >= MAX_SIMULTANEOUS_PARTICLES) {
+      return;
+    }
+
+    const availableBudget = Math.max(0, MAX_SIMULTANEOUS_PARTICLES - this.activeParticleCount);
+    const burstCount = Math.min(count, MAX_PARTICLES_PER_BURST, availableBudget);
+
+    for (let index = 0; index < burstCount; index += 1) {
       const angle = Phaser.Math.FloatBetween(0, Math.PI * 2);
-      const distance = Phaser.Math.Between(8, 26);
-      this.tweens.add({
-        targets: particle,
-        x: x + Math.cos(angle) * distance,
-        y: y + Math.sin(angle) * distance,
-        alpha: 0,
-        scale: particle.scale * 0.4,
-        duration: Phaser.Math.Between(180, 320),
-        onComplete: () => particle.destroy()
+      const speed = Phaser.Math.Between(42, 120);
+      const startScale = Phaser.Math.FloatBetween(0.5, 1);
+      this.spawnImageEffect(this.particleEffects, FX_PARTICLE_POOL_SIZE, "particle-dot", {
+        x,
+        y,
+        depth: 18,
+        tint,
+        scale: startScale,
+        alpha: 0.92,
+        durationMs: Phaser.Math.Between(180, 320),
+        endScale: startScale * 0.4,
+        velocityX: Math.cos(angle) * speed,
+        velocityY: Math.sin(angle) * speed
       });
     }
   }

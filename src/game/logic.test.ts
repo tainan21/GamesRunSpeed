@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
+import { CHARACTERS, CHARACTER_ORDER } from "./characters";
 import { BOSSES } from "./config/boss";
 import { ITEM_BY_ID } from "./config/items";
 import { WEAPONS } from "./config/weapons";
+import { EnemySpatialGrid } from "./enemyGrid";
 import {
   appendEquippedWeapon,
   awardXpProgress,
@@ -65,25 +67,16 @@ describe("roguelite roadmap logic", () => {
         chainLightningChance: 0,
         chainLightningTargets: 0,
         chainLightningDamageMultiplier: 0,
-        droneCount: 0
+        droneCount: 0,
+        dodgeChance: 0,
+        summonDamageMultiplier: 1,
+        itemLuck: 0
       },
-      {
-        id: "soldier",
-        label: "Soldier",
-        summary: "",
-        difficultyLabel: "Easy",
-        starterWeapons: ["pistol", "burstRifle"],
-        pros: [],
-        cons: [],
-        accent: 0,
-        panelTint: 0,
-        moveSpeedMultiplier: 0.9,
-        attackSpeedMultiplier: 1.2
-      }
+      CHARACTERS.soldier
     );
 
-    expect(soldierStats.moveSpeed).toBeCloseTo(207);
-    expect(soldierStats.attackSpeedMultiplier).toBeCloseTo(1.2);
+    expect(soldierStats.moveSpeed).toBeCloseTo(218.5);
+    expect(soldierStats.attackSpeedMultiplier).toBeCloseTo(1.15);
 
     const selectedItems = [
       createItemInstance("arcNetwork", "epic", 3, 2),
@@ -96,6 +89,19 @@ describe("roguelite roadmap logic", () => {
     expect(synergyStats.chainLightningTargets).toBeGreaterThan(2);
     expect(synergyStats.lifeSteal).toBeGreaterThan(0.03);
     expect(synergyStats.attackSpeedMultiplier).toBeGreaterThan(1.2);
+  });
+
+  it("registers the full character roster with valid starting weapons", () => {
+    expect(CHARACTER_ORDER).toHaveLength(16);
+
+    for (const characterId of CHARACTER_ORDER) {
+      const character = CHARACTERS[characterId];
+      expect(character.pros.length).toBeGreaterThan(0);
+      expect(character.cons.length).toBeGreaterThan(0);
+      expect(character.passiveEffects.length).toBeGreaterThan(0);
+      expect(WEAPONS[character.startingWeaponId]).toBeDefined();
+      expect(["starterOnly", "draft", "both"]).toContain(WEAPONS[character.startingWeaponId].availability);
+    }
   });
 
   it("uses the density cap curve and item reward cadence", () => {
@@ -132,6 +138,7 @@ describe("roguelite roadmap logic", () => {
     expect(choices.every((weaponId) => WEAPONS[weaponId].tier === 1)).toBe(true);
     expect(choices.includes("pistol")).toBe(false);
     expect(choices.includes("machineGun")).toBe(false);
+    expect(phase20Pool.some((weaponId) => WEAPONS[weaponId].availability === "starterOnly")).toBe(false);
   });
 
   it("schedules fixed bosses, avoids immediate repeats, and enables double-boss milestones", () => {
@@ -247,14 +254,18 @@ describe("roguelite roadmap logic", () => {
       stats,
       selectedItems: items,
       equippedWeapons: [createEquippedWeapon("shotgun", 0), createEquippedWeapon("pistol", 1)],
-      shieldCharges: stats.maxShieldCharges
+      shieldCharges: stats.maxShieldCharges,
+      selectedCharacterId: "tank",
+      activeSynergyIds: getActiveSynergyIds(items)
     });
 
     expect(snapshot.currentHp).toBe(88);
-    expect(snapshot.equippedWeapons).toContain("Shotgun");
+    expect(snapshot.equippedWeapons).toContain("Shotgun (Common)");
     expect(snapshot.projectileCountMin).toBeGreaterThan(0);
     expect(snapshot.projectileCountMax).toBeGreaterThanOrEqual(snapshot.projectileCountMin);
     expect(snapshot.dominantTags.length).toBeGreaterThan(0);
+    expect(snapshot.inventoryEntries.length).toBeGreaterThan(0);
+    expect(snapshot.uniquePassiveLabels.length).toBeGreaterThan(0);
   });
 
   it("opens larger recovery windows early and shorter ones later", () => {
@@ -273,6 +284,14 @@ describe("roguelite roadmap logic", () => {
 
     const thirdPass = getReadyWeapons(secondPass.equippedWeapons, 750, 1);
     expect(thirdPass.fired.map((weapon) => weapon.weaponId)).toContain("pistol");
+  });
+
+  it("creates equipped weapons with authored rarity", () => {
+    const wand = createEquippedWeapon("boneWand", 0);
+    expect(wand.rarity).toBe("legendary");
+
+    const appended = appendEquippedWeapon([createEquippedWeapon("pistol", 0)], "sniperRifle", 1);
+    expect(appended[1].rarity).toBe("rare");
   });
 
   it("keeps telegraphed spawns inside the arena and resolves them by time", () => {
@@ -300,6 +319,23 @@ describe("roguelite roadmap logic", () => {
     expect(resolved.pending.map((spawn) => spawn.id)).toEqual([2]);
   });
 
+  it("queries nearby enemies through the lightweight spatial grid", () => {
+    const grid = new EnemySpatialGrid<{ uid: number; x: number; y: number; active: boolean }>(96);
+    const entries = [
+      { uid: 1, x: 100, y: 100, active: true },
+      { uid: 2, x: 148, y: 118, active: true },
+      { uid: 3, x: 360, y: 360, active: true },
+      { uid: 4, x: 144, y: 112, active: false }
+    ];
+    const out: Array<{ uid: number; x: number; y: number; active: boolean }> = [];
+
+    grid.rebuild(entries);
+    const count = grid.queryRadius(120, 110, 48, out);
+
+    expect(count).toBe(2);
+    expect(out.map((entry) => entry.uid).sort((a, b) => a - b)).toEqual([1, 2]);
+  });
+
   it("persists only the last selected character in profile storage", () => {
     const storage = new Map<string, string>();
     const adapter = {
@@ -314,6 +350,8 @@ describe("roguelite roadmap logic", () => {
     expect(loadProfile(adapter)).toEqual({ lastCharacterId: "soldier" });
     saveProfile(adapter, { lastCharacterId: "tank" });
     expect(loadProfile(adapter)).toEqual({ lastCharacterId: "tank" });
+    saveProfile(adapter, { lastCharacterId: "trickster" });
+    expect(loadProfile(adapter)).toEqual({ lastCharacterId: "trickster" });
     storage.set("roguelite-v3-profile", "{not-json");
     expect(loadProfile(adapter)).toEqual({ lastCharacterId: "soldier" });
   });

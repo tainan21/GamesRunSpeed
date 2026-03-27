@@ -14,8 +14,24 @@ function sanitizeProfile(raw: unknown): PersistentProfile {
   const candidate = raw as Partial<PersistentProfile> & { lastCharacterId?: string };
 
   return {
+    // Keep profile validation explicit so the saved character can't drift to an invalid id.
     lastCharacterId:
-      candidate.lastCharacterId === "soldier" || candidate.lastCharacterId === "scout" || candidate.lastCharacterId === "tank"
+      candidate.lastCharacterId === "soldier" ||
+      candidate.lastCharacterId === "scout" ||
+      candidate.lastCharacterId === "tank" ||
+      candidate.lastCharacterId === "sniper" ||
+      candidate.lastCharacterId === "pyromancer" ||
+      candidate.lastCharacterId === "chemist" ||
+      candidate.lastCharacterId === "engineer" ||
+      candidate.lastCharacterId === "berserker" ||
+      candidate.lastCharacterId === "lightningAdept" ||
+      candidate.lastCharacterId === "guardian" ||
+      candidate.lastCharacterId === "ranger" ||
+      candidate.lastCharacterId === "assassin" ||
+      candidate.lastCharacterId === "necromancer" ||
+      candidate.lastCharacterId === "gladiator" ||
+      candidate.lastCharacterId === "alchemist" ||
+      candidate.lastCharacterId === "trickster"
         ? candidate.lastCharacterId
         : DEFAULT_PERSISTENT_PROFILE.lastCharacterId
   };

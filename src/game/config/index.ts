@@ -2,6 +2,7 @@ export * from "./arena";
 export * from "./boss";
 export * from "./enemies";
 export * from "./items";
+export * from "./performance";
 export * from "./phases";
 export * from "./player";
 export * from "./progression";
